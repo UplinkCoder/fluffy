@@ -14,7 +14,8 @@ module core.thread.myFiber;
 version(LDC)
 {
    import dmd.myFiber_ldc;
-   mixin(module_string);
+   // mixin(module_string);
+   public import core.thread.fiber;
 }
 else
 {

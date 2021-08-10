@@ -665,7 +665,14 @@ struct TaskGroup
 
         while(!groupLock.servingMe(myTicket))
         {
-            printf("Wating for groupLock\n");
+/+
+            printf("myTicket %d ... currentTicket %d\n", myTicket, groupLock.currentlyServing);
+            printf("Waiting for groupLock ... because of [%s:%d|%s]\n", 
+                groupLock.lastAquiredLoc.file.ptr,
+                groupLock.lastAquiredLoc.line,
+                groupLock.lastAquiredLoc.func.ptr
+            );
++/
         }
 
         printf("AddTask {group: '%s'} {origin: %s:%d}\n", this.name.ptr,
@@ -775,7 +782,7 @@ struct TaskGroup
         }
         while(!groupLock.servingMe(myTicket))
         {
-            printf("Wating for groupLock .. lastAquire by: %s\n", groupLock.lastAquiredLoc.func.ptr);
+            // printf("Waiting for groupLock .. lastAquire by: %s\n", groupLock.lastAquiredLoc.func.ptr);
         }
 
 

@@ -15,7 +15,7 @@ struct Ticket
 struct TicketCounter
 {
 @nogc: nothrow:
-    shared align(16) uint nextTicket;
+    shared align(16) uint nextTicket = -1;
     shared align(16) uint currentlyServing;
 
 
@@ -32,6 +32,7 @@ struct TicketCounter
     Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
         pragma(inline, true);
+        lastAquiredLoc = Loc(func, file, line);
         waiters[core.atomic.atomicOp!"+="(this.n_waiters, 1) % 64] = Loc(func, file, line);
         return Ticket(atomicOp!"+="(nextTicket, 1));
     }
