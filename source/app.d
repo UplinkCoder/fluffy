@@ -401,7 +401,7 @@ void main()
     import std.functional : toDelegate;
     addTask(Task((toDelegate(&loadFiles)), cast(shared void*)&fName, false, cast(shared void*)&result));
     printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
-    Thread.sleep(msecs(500));
+    Thread.sleep(msecs(60));
     // you have half a second.
     foreach(i; 0 .. workers.length)
     {
