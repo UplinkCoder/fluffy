@@ -66,7 +66,6 @@ struct TaskQueue
             // update readP and writeP
             if (readP == writeP)
             {
-                assert(tasksInQueue() == 0);
                 return false;
             }
         }
@@ -156,6 +155,9 @@ void workerFunction () {
 }
 void main()
 {
+    import core.memory;
+    GC.disable();
+
     import std.parallelism : totalCPUs;
 
     workers.length = totalCPUs;
