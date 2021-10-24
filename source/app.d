@@ -58,6 +58,18 @@ struct TaskQueue
     bool pull(Task* task) shared
     {
         // printf("try pulling\n");
+        // as an optimisation we check for an empty queue first
+        {
+            const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
+            const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
+            // printf("before pull -- readP: %d, writeP: %d\n", readP, writeP);
+            // update readP and writeP
+            if (readP == writeP)
+            {
+                assert(tasksInQueue() == 0);
+                return false;
+            }
+        }
         auto ticket = queueLock.drawTicket();
         while(!queueLock.servingMe(ticket)) {}
 
@@ -69,8 +81,7 @@ struct TaskQueue
             // update readP and writeP
             if (readP == writeP)
             {
-                import std.conv;
-                assert(tasksInQueue() == 0, to!string(tasksInQueue()));
+                assert(tasksInQueue() == 0);
                 return false;
             }
 
@@ -111,47 +122,50 @@ shared:
     TaskQueue queue;
 }
 
+shared Worker[] workers;
+
+void workerFunction () {
+    static shared int workerCounter;
+    int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
+    printf("Startnig: %d\n", workerIndex);
+    shared(TaskQueue)* myQueue = &workers[workerIndex].queue;
+    bool terminate = false;
+    int myCounter = 0;
+    Task task;
+    while(!terminate)
+    {
+        if ((myQueue.pull(&task)))
+        {
+            if (task.fn is terminationDg)
+            {
+                terminate = true;
+                printf("[%d] recieved termination signal\n", workerIndex);
+            }
+        }
+        import core.stdc.stdio;
+        if (myCounter++ == 12 || terminate)
+        {
+            int target = cast(int) (workerIndex ? workerIndex - 1 : workers.length - 1);
+            printf("[%d] sending termination signal to [%d]\n", workerIndex, target);
+            while (!workers[target].workerThread) {} // wait for target to be born
+
+            workers[target].queue.enqueueTermination(); // kill target
+        }
+
+    }
+}
 void main()
 {
     import std.parallelism : totalCPUs;
 
-    Worker[] workers = new Worker[](totalCPUs);
+    workers.length = totalCPUs;
 
     import core.stdc.stdio;
 
     printf("Found %d cores\n", totalCPUs);
-    shared int workerCounter;
     foreach(i; 0 .. totalCPUs())
     {
-        workers[i] = Worker(new Thread(() {
-            int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
-            printf("Startnig: %d\n", workerIndex);
-            shared(TaskQueue)* myQueue = &workers[workerIndex].queue;
-            bool terminate = false;
-            int myCounter = 0;
-            while(!terminate)
-            {
-                Task task;
-                if ((myQueue.pull(&task)))
-                {
-                    if (task.fn is terminationDg)
-                    {
-                        terminate = true;
-                        printf("[%d] recieved termination signal\n", workerIndex);
-                    }
-                }
-                import core.stdc.stdio;
-                if (myCounter++ == 12 || terminate)
-                {
-                    int target = cast(int) (workerIndex ? workerIndex - 1 : workers.length - 1);
-                    printf("[%d] sending termination signal to [%d]\n", workerIndex, target);
-                    while (!workers[target].workerThread) {} // wait for target to be born
- 
-                    workers[target].queue.enqueueTermination(); // kill target
-                }
-
-            }
-        }));
+        workers[i] = cast(shared) Worker(new Thread(&workerFunction));
     }
     // all need be initted before we start them
     foreach(i; 0 .. totalCPUs())
