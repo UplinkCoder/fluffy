@@ -26,14 +26,11 @@ struct TicketCounter
         string file;
         int line;
     }
-    Loc[64] waiters;
     int n_waiters;
 
     Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
         pragma(inline, true);
-        lastAquiredLoc = Loc(func, file, line);
-        waiters[core.atomic.atomicOp!"+="(this.n_waiters, 1) % 64] = Loc(func, file, line);
         return Ticket(atomicOp!"+="(nextTicket, 1));
     }
 
