@@ -41,6 +41,7 @@ struct Alloc
         sz = cast(uint)align16(sz);
         assert(capacity_remaining > sz);
         ubyte* result = cast(ubyte*)(memPtr + sz);
+        (cast()memPtr) += sz;
         (cast()capacity_remaining) -= sz;
         return result;
     }
@@ -84,7 +85,6 @@ shared(void*) loadFiles(shared void* arg)
                 {
                     if (word == "import")
                     {
-                        printf("got import\n");
                         assert(!loadNext, "import following import is forbidden");
                         loadNext = true;
                     }
@@ -93,6 +93,7 @@ shared(void*) loadFiles(shared void* arg)
                         loadNext = false;
                         if (exists(word)) // if we get the name of a anoter file spwan a new file loader
                         {
+                            printf("got import: %.*s\n", cast(int) word.length, word.ptr);
                             string[] sResult;
                             auto ptr = cast(shared void*) pushString(word);
                             import std.functional : toDelegate;
@@ -257,6 +258,7 @@ align(16) struct TaskQueue {
                 return false;
             }
             mixin(zoneMixin("Read"));
+            printf("pulled task from queue\n");
             atomicFence!(MemoryOrder.seq)();
             *task = cast()queue[readP];
 
@@ -356,7 +358,7 @@ void main()
     alloc = cast(shared) Alloc(ushort.max * 8);
 
 //    workers.length = totalCPUs - 1;
-    workers.length = 3;
+    workers.length = 4;
 
     void* queueMemory = malloc(align16(TaskQueue.sizeof * workers.length));
     shared(TaskQueue)* alignedMem = cast(shared TaskQueue*) align16(cast(size_t)queueMemory);
