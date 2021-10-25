@@ -16,7 +16,6 @@ class TaskFiber : Fiber
 
     this(Task* currentTask, FiberPool* pool = null, int idx = int.max)
     {
-
         this.pool = pool;
         this.idx = idx;
 
@@ -38,7 +37,6 @@ class TaskFiber : Fiber
     {
         if (currentTask)
         {
-            // hasTask = true;
             assert(state() != State.TERM, "Attempting to start a finished task");
             currentTask.result = currentTask.fn(currentTask.taskData);
             {
@@ -76,13 +74,13 @@ struct FiberPool
     
     private uint freeBitfield = ~0;
     
-    static immutable INVALID_FIBER_IDX = uint.max;
+    static immutable INVALID_FIBER_IDX = 0;
     
     uint nextFree()
     {
         pragma(inline, true);
         import core.bitop : bsf;
-        return freeBitfield ? bsf(freeBitfield)  : INVALID_FIBER_IDX;
+        return freeBitfield ? bsf(freeBitfield) + 1 : INVALID_FIBER_IDX;
     }
     
     uint n_free()
@@ -140,12 +138,11 @@ struct FiberPool
     
     TaskFiber* getNext() return
     {
-        if (n_free())
+        if (const fiberIdx = nextFree())
         {
-            const fiberIdx = nextFree();
             assert(fiberIdx != INVALID_FIBER_IDX);
-            freeBitfield &= ~(1 << fiberIdx);
-            return &fibers[fiberIdx];
+            freeBitfield &= ~(1 << (fiberIdx - 1));
+            return &fibers[fiberIdx - 1];
         }
         assert(0);
         //return null;

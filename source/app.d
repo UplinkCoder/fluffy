@@ -130,7 +130,7 @@ bool addTask(Task task)
     static currentQueue = 0;
     scope(exit)
     {
-        if (++currentQueue > queues.length)
+        if (++currentQueue >= queues.length)
             currentQueue = 0;
     }
 
@@ -299,6 +299,7 @@ shared TaskQueue[] queues = void;
 struct Worker
 {
     Thread workerThread;
+    FiberPool workerFiberPool;
 }
 
 shared Worker[] workers;
@@ -321,20 +322,34 @@ void workerFunction () {
     // ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
     shared(TaskQueue)* myQueue = &queues[workerIndex];
+    FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
+    fiberPool.initFiberPool();
     bool terminate = false;
     int myCounter = 0;
     Task task;
     while(!terminate)
     {
-        if ((myQueue.pull(&task)))
+        if (auto idx = fiberPool.nextFree())
         {
-            if (task.fn is terminationDg)
+            if ((myQueue.pull(&task)))
             {
-                terminate = true;
-                // TracyMessage("recieved termination signal");
-            }
+                if (task.fn is terminationDg)
+                {
+                    terminate = true;
+                    // TracyMessage("recieved termination signal");
+                }
 
-            task.result = task.fn(task.taskData);
+                task.result = task.fn(task.taskData);
+            }
+            else if (!fiberPool.n_used)
+            {
+                Thread.sleep(1.usecs);
+            }
+        }
+        else
+        {
+            // the fiber pool is full
+            // which means 
         }
         import core.stdc.stdio;
         if (myCounter++ || terminate)
