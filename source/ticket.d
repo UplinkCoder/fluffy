@@ -31,6 +31,7 @@ struct TicketCounter
     Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
         pragma(inline, true);
+        __itt_sync_prepare(cast(void*) &this);
         return Ticket(atomicOp!"+="(nextTicket, 1) - 1);
     }
 

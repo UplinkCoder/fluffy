@@ -13,12 +13,13 @@ module core.thread.myFiber;
 
 version(LDC)
 {
-   import dmd.myFiber_ldc;
-   mixin(module_string);
-//   public import core.thread.fiber;
+   //import dmd.myFiber_ldc;
+   //mixin(module_string);
+   public import core.thread.fiber;
 }
 else
 {
-    import dmd.myFiber_dmd;
-    mixin(module_string);
+//    import dmd.myFiber_dmd;
+//    mixin(module_string);
+    public import core.thread.fiber;
 }

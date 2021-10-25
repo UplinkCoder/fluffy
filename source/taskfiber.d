@@ -12,7 +12,7 @@ class TaskFiber : Fiber
     /*tls*/ static bool initLoop;
     Task currentTask;
     int idx;
-    align(16) shared bool hasTask;
+    bool hasTask;
 
     this(int idx = int.max)
     {
@@ -20,6 +20,7 @@ class TaskFiber : Fiber
         super(&doTask, ushort.max * 8);
         // use large stack of ushort.max * 8
         // otherwise we can crash in the parser or deeper semantic
+        this.idx = idx;
     }
 
     void doTask()
@@ -27,10 +28,10 @@ class TaskFiber : Fiber
         if (hasTask)
         {
             assert(state() != State.TERM, "Attempting to start a finished task");
-            currentTask.result = currentTask.fn(currentTask.taskData);
+            currentTask.fn(currentTask.taskData);
             {
-                string s = stateToString(state());
-                printf("Task state after calling fn: %s\n", s.ptr);
+                // string s = stateToString(state());
+                // printf("Task state after calling fn: %s\n", s.ptr);
             }
         }
         else
@@ -129,20 +130,22 @@ struct FiberPool
         return fibers[0] !is null;
     }
     
-    void free(TaskFiber* fiber)
+    void free(TaskFiber* fiber, int line = __LINE__)
     {
+        printf("freeing fiber: %p (idx:%d) from: %d\n", *fiber, fiber.idx, line);
+        assert(!fiber.hasTask);
         const fiberIdx = fiber.idx;
         assert(fiberIdx < fibers.length);
         freeBitfield |= (1 << fiberIdx);
     }
     
-    TaskFiber* getNextFree() return
+    TaskFiber getNextFree() return
     {
         if (const fiberIdx = nextFree())
         {
             assert(fiberIdx != INVALID_FIBER_IDX);
             freeBitfield &= ~(1 << (fiberIdx - 1));
-            return &fibers[fiberIdx - 1];
+            return fibers[fiberIdx - 1];
         }
         assert(0);
         //return null;
@@ -151,11 +154,9 @@ struct FiberPool
 
 shared struct Task
 {
-    shared (void*) function (shared void*) fn;
+    void function (shared void*) fn;
     shared (void*) taskData;
     bool isBackgroundTask;
-
-    void* result;
 
     shared Task*[] children;
     shared size_t n_children_completed;

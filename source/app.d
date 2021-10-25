@@ -6,17 +6,23 @@ import fluffy.ticket;
 import core.thread;
 import core.atomic;
 import core.stdc.stdio;
-//import tracy;
-
-string zoneMixin(string zoneName)
+static if (0)
 {
-    return "";
+    import tracy;
 }
+else
+{
+    extern (C) void ___tracy_set_thread_name( const char* name ) {}
 
-alias task_dg_t = shared (void*) function (shared void*);
+    string zoneMixin(string zoneName)
+    {
+        return "";
+    }
+}
+alias task_dg_t = void function (shared void*);
 
 static  immutable task_dg_t terminationDg =
-    (shared void*) { return cast(shared void*)null; };
+    (shared void*) { };
 
 
 struct Alloc
@@ -64,29 +70,36 @@ string* pushString(string s)
     return result;
 }
 
-shared(void*) loadFiles(shared void* arg)
+void loadFiles(shared void* arg)
 {
+    static shared string[][string] knownMods;
+
     string* fArg = cast(string*) arg;
-    printf("Executing load files: %s\n", (*fArg).ptr);
+    // printf("Executing load files: %s\n", (*fArg).ptr);
     import std.file;
     import std.algorithm;
-
+    static shared TicketCounter addModuleLock;
     if (fArg)
     {
         string[] words;
-        string text = null;
         if (exists(*fArg))
         {
-            printf("loading: %s\n", (*fArg).ptr);
-            text = cast(string) read(*fArg);
+            // printf("loading: %s\n", (*fArg).ptr);
+            import fluffy.mmfile;
+            MmFile fluff_file = MmFile(*fArg);
+            assert(Fiber.getThis());
+            const text = cast(string)fluff_file.opSlice[];
             // printf("loading complete, text: %s\n", text.ptr);
             foreach(line;text.splitter('\n'))
             {
                 if (auto fib = Fiber.getThis())
                 {
+                    // ___tracy_emit_message("We should yield", "We should yield".length, 0);
+                    // printf("Yield\n");
                     fib.yield();
                     // we yield because presumably someone else wants to execute as well
                 }
+
                 bool loadNext = false;
                 foreach(word;line.splitter(' '))
                 {
@@ -100,22 +113,24 @@ shared(void*) loadFiles(shared void* arg)
                         loadNext = false;
                         if (exists(word)) // if we get the name of a anoter file spwan a new file loader
                         {
-                            printf("got import: %.*s\n", cast(int) word.length, word.ptr);
+                            // printf("got import: %.*s\n", cast(int) word.length, word.ptr);
                             string[] sResult;
                             auto ptr = cast(shared void*) pushString(word);
-                            addTask(Task(&loadFiles, ptr, false, cast(shared void*)&sResult));
+                            addTask(Task(&loadFiles, ptr));
 
                         }
                     }
                     else
                     {
-                        // we got a word.
+                        //if (words.)
                     }
                 }
             }
+
+
         }
     }
-    return null;
+    return ;
 }
 
 struct TaskInQueue
@@ -159,11 +174,24 @@ align(16) struct TaskQueue {
     /// a read pointer of -1 signifies the queue is empty
 
 
-    int tasksInQueue() shared
+    int tasksInQueue(bool consistent = false) shared
     {
+        Ticket ticket;
+        if (consistent)
+        {
+            ticket = queueLock.drawTicket();
+            while (!queueLock.servingMe(ticket)) {}
+            atomicFence();
+        }
+        scope(exit)
+        {
+            if (consistent) queueLock.releaseTicket(ticket);
+        }
         const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
         const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
         return cast(int)(writeP - readP);
+
+
     }
 
     void initQueue() shared
@@ -317,8 +345,28 @@ enum threadproc;
 @threadproc void watcherFunction ()
 {
     // who watches the watchman
-    // ___tracy_set_thread_name(`Watcher`);
-    
+    ___tracy_set_thread_name(`Watcher`);
+    mixin(zoneMixin("watcherTime"));
+
+    uint lastCompletedTasks;
+
+    while((lastCompletedTasks = atomicLoad(completedTasks)) < 10_000)
+    {
+        // ___tracy_emit_plot("completedTasks", lastCompletedTasks);
+        Thread.sleep(1.usecs);
+    }
+    // you have half a second.
+    {
+        mixin(zoneMixin("enqueueingTermnination"));
+        foreach(i; 0 .. workers.length)
+        {
+            bool enqueuedTermination = false;
+            while(!enqueuedTermination)
+            {
+                enqueuedTermination = queues[i].enqueueTermination();
+            };
+        }
+    }
 }
 
 shared TicketCounter globalLock;
@@ -328,16 +376,19 @@ shared TicketCounter globalLock;
     /*tls*/ int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
     /*tls*/ char[16] worker_name;
     sprintf(&worker_name[0], "Worker %d", workerIndex);
-    // ___tracy_set_thread_name(&worker_name[0]);
+    ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
     /*tls*/ shared(TaskQueue)* myQueue = &queues[workerIndex];
     /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
     {
         auto initTicket = globalLock.drawTicket();
+
         atomicFence();
         while (!globalLock.servingMe(initTicket)) {}
+
         atomicFence();
         /*tls*/ fiberPool.initFiberPool();
+
         atomicFence();
         globalLock.releaseTicket(initTicket);
     }
@@ -363,7 +414,7 @@ shared TicketCounter globalLock;
                     // TracyMessage("recieved termination signal");
                 }
 
-                execFiber = *fiberPool.getNextFree();
+                execFiber = fiberPool.getNextFree();
                 execFiber.assignTask(&task);
                 //task.result = task.fn(task.taskData);
             }
@@ -378,6 +429,7 @@ shared TicketCounter globalLock;
 
         if (!execFiber)
         {
+            //printf("no new task ... searching for fiber to exec -- %llx\n", fiberPool.freeBitfield);
             // if we didn't add a task just now chose a random fiber to exec
             const nonFree = ~fiberPool.freeBitfield;
             ulong nextExecMask;
@@ -396,23 +448,26 @@ shared TicketCounter globalLock;
                 localNextIdx = (++localNextIdx & 63);
             }
         }
-
+        // ___tracy_emit_plot(worker_name.ptr, myQueue.tasksInQueue(true));
         // execute a fiber in the pool
         {
             mixin(zoneMixin("FiberExecution"));
+            //printf("executing fiber: %p -- idx:%d\n", execFiber, execFiber.idx);
             //printf("stateBeforeExec: %s\n", execFiber.stateToString(execFiber.state()).ptr);
             assert(execFiber.state() == execFiber.state().HOLD, execFiber.stateToString(execFiber.state()));
-           execFiber.call();
+            execFiber.call();
             // if this completed the fiber we need to to reset it and send it back to the pool
             if (execFiber.state() == execFiber.state().TERM)
             {
+                printf("We just completed a task on fiberIdx: %p\n", &execFiber.idx);
                 atomicOp!"+="(completedTasks, 1);
-                execFiber.reset();
                 execFiber.hasTask = false;
+
                 fiberPool.free(&execFiber);
+                execFiber.reset();
+
             }
         }
-
     }
 }
 shared int completedTasks;
@@ -441,7 +496,7 @@ void main(string[] args)
     if (!n_workers)
         n_workers = totalCPUs - 1;
 
-    printf("starting $d workers\n", n_workers);
+    printf("starting %d workers\n", n_workers);
     workers.length = n_workers;
 
     void* queueMemory = malloc(align16(TaskQueue.sizeof * workers.length));
@@ -468,8 +523,18 @@ void main(string[] args)
         }
     }
 
-        printf("All workers are initialized\n");
-        // all need be initted before we start them
+
+    string fName = "a";
+    string[] result;
+    addTask(Task(&loadFiles, cast(shared void*)&fName, false));
+    // printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
+    // Thread.sleep(msecs(100));
+
+    // task should now be in queue zero
+    // printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
+
+    printf("All workers are initialized\n");
+    // all need be initted before we start them
     {
         mixin(zoneMixin("threadStartup"));
         foreach(i; 0 .. workers.length)
@@ -477,23 +542,9 @@ void main(string[] args)
             (cast()workers[i].workerThread).start();
         }
     }
-
-    string fName = "a";
-    string[] result;
-    addTask(Task(&loadFiles, cast(shared void*)&fName, false, cast(shared void*)&result));
-    printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
-    Thread.sleep(msecs(100));
-    // you have half a second.
-    foreach(i; 0 .. workers.length)
-    {
-        bool enqueuedTermination = false;
-        while(!enqueuedTermination)
-        {
-            enqueuedTermination = queues[i].enqueueTermination();
-        };
-    }
-    // task should now be in queue zero
-    printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
+    // fire up the watcher which terminates the threads
+    auto watcher = new Thread(&watcherFunction, 128);
+    watcher.start();
 
     {
         mixin(zoneMixin("Worker-Time"));
@@ -502,6 +553,6 @@ void main(string[] args)
             (cast()workers[i].workerThread).join();
         }
     }
-
+    watcher.join();
     printf("completedTasks: %d\n", completedTasks);
 }
