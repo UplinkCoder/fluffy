@@ -151,7 +151,7 @@ struct FiberPool
 
 shared struct Task
 {
-    shared (void*) delegate (shared void*) fn;
+    shared (void*) function (shared void*) fn;
     shared (void*) taskData;
     bool isBackgroundTask;
 

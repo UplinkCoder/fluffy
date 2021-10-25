@@ -13,7 +13,7 @@ string zoneMixin(string zoneName)
     return "";
 }
 
-alias task_dg_t = shared (void*) delegate (shared void*);
+alias task_dg_t = shared (void*) function (shared void*);
 
 static  immutable task_dg_t terminationDg =
     (shared void*) { return cast(shared void*)null; };
@@ -98,8 +98,7 @@ shared(void*) loadFiles(shared void* arg)
                             printf("got import: %.*s\n", cast(int) word.length, word.ptr);
                             string[] sResult;
                             auto ptr = cast(shared void*) pushString(word);
-                            import std.functional : toDelegate;
-                            addTask(Task(toDelegate(&loadFiles), ptr, false, cast(shared void*)&sResult));
+                            addTask(Task(&loadFiles, ptr, false, cast(shared void*)&sResult));
                         }
                     }
                     else
@@ -413,8 +412,7 @@ void main()
 
     string fName = "a";
     string[] result;
-    import std.functional : toDelegate;
-    addTask(Task((toDelegate(&loadFiles)), cast(shared void*)&fName, false, cast(shared void*)&result));
+    addTask(Task(&loadFiles, cast(shared void*)&fName, false, cast(shared void*)&result));
     printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
     Thread.sleep(msecs(60));
     // you have half a second.
