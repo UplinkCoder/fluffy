@@ -12,7 +12,7 @@
 module dmd.myFiber_dmd;
 enum module_string = q{
 
-#line 16 "src/dmd/myFiber_dmd.d"
+#line 16 "source/myFiber_dmd.d"
 import core.thread.osthread;
 import core.thread.threadgroup;
 import core.thread.types;

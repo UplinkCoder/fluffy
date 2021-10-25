@@ -99,12 +99,16 @@ shared(void*) loadFiles(shared void* arg)
                             string[] sResult;
                             auto ptr = cast(shared void*) pushString(word);
                             addTask(Task(&loadFiles, ptr, false, cast(shared void*)&sResult));
+                            if (auto fib = Fiber.getThis())
+                            {
+                                fib.yield();
+                                // we yield because presumably someone else wants to execute as well
+                            }
                         }
                     }
                     else
                     {
                         // we got a word.
-                        printf("word: %.*s\n", cast(int)word.length, word.ptr);
                     }
                 }
             }
@@ -259,7 +263,7 @@ align(16) struct TaskQueue {
                 return false;
             }
             mixin(zoneMixin("Read"));
-            printf("pulled task from queue\n");
+            // printf("pulled task from queue\n");
             atomicFence!(MemoryOrder.seq)();
             *task = cast()queue[readP];
 
@@ -304,30 +308,33 @@ struct Worker
 shared Worker[] workers;
 extern (C) void ___tracy_set_thread_name( const char* name );
 
+enum threadproc;
 
-
-void watcherFunction ()
+@threadproc void watcherFunction ()
 {
     // who watches the watchman
     // ___tracy_set_thread_name(`Watcher`);
     
 }
 
-void workerFunction () {
+@threadproc void workerFunction () {
     static shared int workerCounter;
-    int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
-    char[16] worker_name;
+    /*tls*/ int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
+    /*tls*/ char[16] worker_name;
     sprintf(&worker_name[0], "Worker %d", workerIndex);
     // ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
-    shared(TaskQueue)* myQueue = &queues[workerIndex];
-    FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
-    fiberPool.initFiberPool();
-    bool terminate = false;
-    int myCounter = 0;
-    Task task;
+    /*tls*/ shared(TaskQueue)* myQueue = &queues[workerIndex];
+    /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
+    /*tls*/ fiberPool.initFiberPool();
+    /*tls*/ bool terminate = false;
+    /*tls*/ int myCounter = 0;
+    /*tls*/ Task task;
+
+    /*tls*/ static uint nextExecIdx;
     while(!terminate)
     {
+        TaskFiber execFiber;
         if (auto idx = fiberPool.nextFree())
         {
             if ((myQueue.pull(&task)))
@@ -338,26 +345,50 @@ void workerFunction () {
                     // TracyMessage("recieved termination signal");
                 }
 
-                task.result = task.fn(task.taskData);
+                execFiber = *fiberPool.getNextFree();
+                execFiber.assignTask(&task);
+                //task.result = task.fn(task.taskData);
             }
             else if (!fiberPool.n_used)
             {
+                // no fibers used
                 Thread.sleep(1.usecs);
+                continue;
             }
         }
-        else
-        {
-            // the fiber pool is full
-            // which means 
-        }
-        import core.stdc.stdio;
-        if (myCounter++ || terminate)
-        {
-            int target = cast(int) (workerIndex ? workerIndex - 1 : workers.length - 1);
-            // printf("[%d] sending termination signal to [%d]\n", workerIndex, target);
-            while (!workers[target].workerThread) {} // wait for target to be born
 
-            // queues[target].enqueueTermination(); // kill target
+        if (!execFiber)
+        {
+            // if we didn't add a task just now chose a random fiber to exec
+            const nonFree = ~fiberPool.freeBitfield;
+            ulong nextExecMask;
+            auto localNextIdx = nextExecIdx & 63;
+            // make sure the fiber we chose is used
+            for(;;)
+            {
+                nextExecMask = 1UL << localNextIdx;
+                if (nextExecMask & nonFree)
+                {
+                    execFiber = fiberPool.fibers[localNextIdx];
+                    nextExecIdx++;
+                    break;
+                }
+                localNextIdx = (++localNextIdx & 63);
+            }
+        }
+
+        // execute a fiber in the pool
+        {
+            printf("stateBeforeExec: %s\n", execFiber.stateToString(execFiber.state()).ptr);
+            assert(execFiber.state() == execFiber.state().HOLD, execFiber.stateToString(execFiber.state()));
+           execFiber.call();
+            // if this completed the fiber we need to to reset it and send it back to the pool
+            if (execFiber.state() == execFiber.state().TERM)
+            {
+                execFiber.reset();
+                execFiber.hasTask = false;
+                fiberPool.free(&execFiber);
+            }
         }
 
     }
@@ -374,7 +405,7 @@ void main()
     alloc = cast(shared) Alloc(ushort.max * 8);
 
 //    workers.length = totalCPUs - 1;
-    workers.length = 4;
+    workers.length = 12;
 
     void* queueMemory = malloc(align16(TaskQueue.sizeof * workers.length));
     shared(TaskQueue)* alignedMem = cast(shared TaskQueue*) align16(cast(size_t)queueMemory);

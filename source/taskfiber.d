@@ -9,33 +9,22 @@ import fluffy.ticket;
 
 class TaskFiber : Fiber
 {
-    Task* currentTask;
-    FiberPool* pool;
+    /*tls*/ static bool initLoop;
+    Task currentTask;
     int idx;
     align(16) shared bool hasTask;
 
-    this(Task* currentTask, FiberPool* pool = null, int idx = int.max)
+    this(int idx = int.max)
     {
-        this.pool = pool;
-        this.idx = idx;
-
+        assert(idx != int.max);
         super(&doTask, ushort.max * 8);
         // use large stack of ushort.max * 8
         // otherwise we can crash in the parser or deeper semantic
-
-        // currentTask will be null when initalizing a FiberPool
-        if (currentTask)
-        {
-            assert(currentTask.hasFiber && currentTask.currentFiber is null);
-            this.currentTask = currentTask;
-            currentTask.currentFiber = cast(shared TaskFiber*)this;
-            hasTask = true;
-        }
     }
 
     void doTask()
     {
-        if (currentTask)
+        if (hasTask)
         {
             assert(state() != State.TERM, "Attempting to start a finished task");
             currentTask.result = currentTask.fn(currentTask.taskData);
@@ -44,7 +33,16 @@ class TaskFiber : Fiber
                 printf("Task state after calling fn: %s\n", s.ptr);
             }
         }
+        else
+            assert(initLoop, "hasTask can only be false when doTask is called during initalisation");
 
+    }
+
+    void assignTask(Task* task)
+    {
+        assert(!hasTask);
+        this.currentTask = *task;
+        hasTask = true;
     }
 
     static string stateToString(typeof(new Fiber((){}).state()) state)
@@ -72,7 +70,7 @@ struct FiberPool
     TaskFiber[freeBitfield.sizeof * 8] fibers = null;
     void* fiberPoolStorage = null;
     
-    private uint freeBitfield = ~0;
+    uint freeBitfield = ~0;
     
     static immutable INVALID_FIBER_IDX = 0;
     
@@ -112,15 +110,17 @@ struct FiberPool
             this.fiberPoolStorage = malloc(aligned_size * fibers.length);
             pool.fibers = (cast(TaskFiber*)pool.fiberPoolStorage)[0 .. fibers.length];
         }
+        TaskFiber.initLoop = true;
         foreach(int idx, ref f;this.fibers)
         {
             version (none)
             {
                 f = (cast(TaskFiber)(this.fiberPoolStorage + (aligned_size * idx)));
-                f.__ctor(null, &this, idx);
+                f.__ctor(idx);
             }
-            f = new TaskFiber(null, &this, idx);
+            f = new TaskFiber(idx);
         }
+        TaskFiber.initLoop = false;
     }
     
     bool isInitialized()
@@ -136,7 +136,7 @@ struct FiberPool
         freeBitfield |= (1 << fiberIdx);
     }
     
-    TaskFiber* getNext() return
+    TaskFiber* getNextFree() return
     {
         if (const fiberIdx = nextFree())
         {

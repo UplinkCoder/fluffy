@@ -12,7 +12,7 @@
 module dmd.myFiber_ldc;
 
 enum module_string = q{
-#line 16 "src/dmd/myFiber_ldc.d"
+#line 16 "fluffy/myFiber_ldc.d"
 import core.thread.osthread;
 
 version (LDC)
@@ -191,10 +191,15 @@ private
       extern (C) void fiber_switchContext( void** oldp, void* newp ) nothrow @nogc;
       version (AArch64)
           extern (C) void fiber_trampoline() nothrow;
+
+     extern(C) void fiber_switchContext_mine(void ** oldp, void* newp ) nothrow @nogc
+     {
+         return fiber_switchContext(oldp, newp);
+     }
   }
   else version (LDC_Windows)
   {
-    extern (C) void fiber_switchContext( void** oldp, void* newp ) nothrow @nogc @naked
+    extern (C) void fiber_switchContext_mine( void** oldp, void* newp ) nothrow @nogc @naked
     {
         version (X86)
         {
@@ -309,7 +314,7 @@ private
     }
   }
   else
-    extern (C) void fiber_switchContext( void** oldp, void* newp ) nothrow @nogc
+    extern (C) void fiber_switchContext_mine( void** oldp, void* newp ) nothrow @nogc
     {
         // NOTE: The data pushed and popped in this routine must match the
         //       default stack created by Fiber.initStack or the initial
@@ -1952,7 +1957,7 @@ private:
             informSanitizerOfStartSwitchFiber(&__fake_stack, new_bottom, m_size);
         }
 
-        fiber_switchContext( oldp, newp );
+        fiber_switchContext_mine( oldp, newp );
 
         version (SupportSanitizers)
         {
@@ -1999,7 +2004,7 @@ private:
             informSanitizerOfStartSwitchFiber(&__fake_stack, __from_stack_bottom, __from_stack_size);
         }
 
-        fiber_switchContext( oldp, newp );
+        fiber_switchContext_mine( oldp, newp );
 
         version (SupportSanitizers)
         {
