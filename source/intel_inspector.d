@@ -31,13 +31,14 @@ extern (C) @nogc pure nothrow __gshared {
 }
 shared static this()
 {
+
     auto insp_dir_c = getenv("INSPECTOR_2021_DIR");
     auto insp_dir = insp_dir_c ? cast(string) insp_dir_c[0 .. strlen(insp_dir_c)] : null;
     if (insp_dir)
     {
         char[1024] pathbuf;
         sprintf(pathbuf.ptr, "%s/lib64/runtime/libittnotify.so", insp_dir_c);
-        auto lib = dlopen(pathbuf.ptr, RTLD_NOW);
+        auto lib = dlopen(pathbuf.ptr, RTLD_LAZY);
         if (lib)
         {
             __itt_sync_cancel = cast(typeof(__itt_sync_cancel))dlsym(lib, "__itt_sync_cancel");

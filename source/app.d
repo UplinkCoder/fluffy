@@ -23,7 +23,7 @@ struct Alloc
 {
     ubyte* memPtr;
     uint capacity_remaining;
-    TicketCounter allocLock;
+    shared TicketCounter allocLock;
 
     this(uint size)
     {
@@ -82,6 +82,11 @@ shared(void*) loadFiles(shared void* arg)
             // printf("loading complete, text: %s\n", text.ptr);
             foreach(line;text.splitter('\n'))
             {
+                if (auto fib = Fiber.getThis())
+                {
+                    fib.yield();
+                    // we yield because presumably someone else wants to execute as well
+                }
                 bool loadNext = false;
                 foreach(word;line.splitter(' '))
                 {
@@ -99,11 +104,7 @@ shared(void*) loadFiles(shared void* arg)
                             string[] sResult;
                             auto ptr = cast(shared void*) pushString(word);
                             addTask(Task(&loadFiles, ptr, false, cast(shared void*)&sResult));
-                            if (auto fib = Fiber.getThis())
-                            {
-                                fib.yield();
-                                // we yield because presumably someone else wants to execute as well
-                            }
+
                         }
                     }
                     else
@@ -154,7 +155,7 @@ align(16) struct TaskQueue {
     align(16) shared int readPointer; // head
     align(16) shared int writePointer; // tail
 
-    Task[1024] queue;
+    Task[1024]* queue;
     /// a read pointer of -1 signifies the queue is empty
 
 
@@ -167,8 +168,11 @@ align(16) struct TaskQueue {
 
     void initQueue() shared
     {
+        import core.stdc.stdlib;
         readPointer = writePointer = 0;
         queueLock = TicketCounter.init;
+        void* taskMemPtr = malloc(align16((*queue).sizeof));
+        queue = cast(typeof(queue))align16(cast(size_t)taskMemPtr);
     }
 
     bool enqueueTermination() shared
@@ -190,7 +194,7 @@ align(16) struct TaskQueue {
             while(!queueLock.servingMe(ticket)) {}
         }
         // we've got the lock
-        printf("push Task\n");
+        //printf("push Task\n");
         scope (exit) queueLock.releaseTicket(ticket);
         {
             const readP = atomicLoad(readPointer) & (queue.length - 1);
@@ -212,7 +216,7 @@ align(16) struct TaskQueue {
             }
 
             {
-                cast()queue[writeP] = *task;
+                cast()(*queue)[writeP] = *task;
                 atomicFence!(MemoryOrder.seq)();
             }
 
@@ -265,7 +269,7 @@ align(16) struct TaskQueue {
             mixin(zoneMixin("Read"));
             // printf("pulled task from queue\n");
             atomicFence!(MemoryOrder.seq)();
-            *task = cast()queue[readP];
+            *task = cast()(*queue)[readP];
 
             atomicOp!"+="(readPointer, 1);
         }
@@ -317,6 +321,8 @@ enum threadproc;
     
 }
 
+shared TicketCounter globalLock;
+
 @threadproc void workerFunction () {
     static shared int workerCounter;
     /*tls*/ int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
@@ -326,7 +332,18 @@ enum threadproc;
     // printf("Startnig: %d\n", workerIndex);
     /*tls*/ shared(TaskQueue)* myQueue = &queues[workerIndex];
     /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
-    /*tls*/ fiberPool.initFiberPool();
+    {
+        auto initTicket = globalLock.drawTicket();
+        atomicFence();
+        while (!globalLock.servingMe(initTicket)) {}
+        atomicFence();
+        /*tls*/ fiberPool.initFiberPool();
+        atomicFence();
+        globalLock.releaseTicket(initTicket);
+    }
+
+
+
     /*tls*/ bool terminate = false;
     /*tls*/ int myCounter = 0;
     /*tls*/ Task task;
@@ -334,6 +351,7 @@ enum threadproc;
     /*tls*/ static uint nextExecIdx;
     while(!terminate)
     {
+        mixin(zoneMixin("WorkerLoop"));
         TaskFiber execFiber;
         if (auto idx = fiberPool.nextFree())
         {
@@ -352,6 +370,7 @@ enum threadproc;
             else if (!fiberPool.n_used)
             {
                 // no fibers used
+                mixin(zoneMixin("sleepnig"));
                 Thread.sleep(1.usecs);
                 continue;
             }
@@ -366,6 +385,7 @@ enum threadproc;
             // make sure the fiber we chose is used
             for(;;)
             {
+                mixin(zoneMixin("FindNextFiber"));
                 nextExecMask = 1UL << localNextIdx;
                 if (nextExecMask & nonFree)
                 {
@@ -379,12 +399,14 @@ enum threadproc;
 
         // execute a fiber in the pool
         {
-            printf("stateBeforeExec: %s\n", execFiber.stateToString(execFiber.state()).ptr);
+            mixin(zoneMixin("FiberExecution"));
+            //printf("stateBeforeExec: %s\n", execFiber.stateToString(execFiber.state()).ptr);
             assert(execFiber.state() == execFiber.state().HOLD, execFiber.stateToString(execFiber.state()));
            execFiber.call();
             // if this completed the fiber we need to to reset it and send it back to the pool
             if (execFiber.state() == execFiber.state().TERM)
             {
+                atomicOp!"+="(completedTasks, 1);
                 execFiber.reset();
                 execFiber.hasTask = false;
                 fiberPool.free(&execFiber);
@@ -393,19 +415,34 @@ enum threadproc;
 
     }
 }
-void main()
+shared int completedTasks;
+
+void main(string[] args)
 {
     mixin(zoneMixin("Main"));
-
+     
     import core.memory;
     GC.disable();
 
     import std.parallelism : totalCPUs;
     import core.stdc.stdlib;
-    alloc = cast(shared) Alloc(ushort.max * 8);
+    alloc = cast(shared) Alloc(ushort.max * ushort.max);
 
+    int n_workers;
 //    workers.length = totalCPUs - 1;
-    workers.length = 12;
+    if (args.length == 2 && args[1].length && args[1].length < 3)
+    {
+        n_workers = 0;
+        if (args[1].length == 2)
+            n_workers += ((args[1][0] - '0') * 10);
+        n_workers += (args[1][$-1] - '0');
+    }
+
+    if (!n_workers)
+        n_workers = totalCPUs - 1;
+
+    printf("starting $d workers\n", n_workers);
+    workers.length = n_workers;
 
     void* queueMemory = malloc(align16(TaskQueue.sizeof * workers.length));
     shared(TaskQueue)* alignedMem = cast(shared TaskQueue*) align16(cast(size_t)queueMemory);
@@ -445,11 +482,15 @@ void main()
     string[] result;
     addTask(Task(&loadFiles, cast(shared void*)&fName, false, cast(shared void*)&result));
     printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
-    Thread.sleep(msecs(60));
+    Thread.sleep(msecs(100));
     // you have half a second.
     foreach(i; 0 .. workers.length)
     {
-        queues[i].enqueueTermination();
+        bool enqueuedTermination = false;
+        while(!enqueuedTermination)
+        {
+            enqueuedTermination = queues[i].enqueueTermination();
+        };
     }
     // task should now be in queue zero
     printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
@@ -461,4 +502,6 @@ void main()
             (cast()workers[i].workerThread).join();
         }
     }
+
+    printf("completedTasks: %d\n", completedTasks);
 }
