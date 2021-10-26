@@ -19,10 +19,8 @@ else
         return "";
     }
 }
-alias task_dg_t = void function (shared void*);
-
-static  immutable task_dg_t terminationDg =
-    (shared void*) { };
+static  immutable task_function_t terminationDg =
+    (Task*) { };
 
 
 struct Alloc
@@ -70,73 +68,6 @@ string* pushString(string s)
     return result;
 }
 
-void loadFiles(shared void* arg)
-{
-    static shared string[][string] knownMods;
-
-    string* fArg = cast(string*) arg;
-    // printf("Executing load files: %s\n", (*fArg).ptr);
-    import std.file;
-    import std.algorithm;
-    static shared TicketCounter addModuleLock;
-    if (fArg)
-    {
-        string[] words;
-        if (exists(*fArg))
-        {
-            // printf("loading: %s\n", (*fArg).ptr);
-            import fluffy.mmfile;
-            MmFile fluff_file = MmFile(*fArg);
-            assert(Fiber.getThis());
-            const text = cast(string)fluff_file.opSlice[];
-            bool yieldOnNextWord = false;
-            // printf("loading complete, text: %s\n", text.ptr);
-            foreach(line;text.splitter('\n'))
-            {
-                bool loadNext = false;
-                foreach(word;line.splitter(' '))
-                {
-                    if (word == "import")
-                    {
-                        assert(!loadNext, "import following import is forbidden");
-                        loadNext = true;
-                    }
-                    else if (loadNext)
-                    {
-                        loadNext = false;
-                        if (exists(word)) // if we get the name of a anoter file spwan a new file loader
-                        {
-                            // printf("got import: %.*s\n", cast(int) word.length, word.ptr);
-                            string[] sResult;
-                            auto ptr = cast(shared void*) pushString(word);
-                            addTask(Task(&loadFiles, ptr));
-                            yieldOnNextWord = true;
-                        }
-                    }
-                    else
-                    {
-                        //if (words.)
-                        if (yieldOnNextWord)
-                        {
-                            if (auto fib = Fiber.getThis())
-                            {
-                                fib.yield();
-                                yieldOnNextWord = false;
-                                // ___tracy_emit_message("We should yield", "We should yield".length, 0);
-                                // printf("Yield\n");
-                                // we yield because presumably someone else wants to execute as well
-                            }
-                        }
-                    }
-                }
-            }
-
-
-        }
-    }
-    return ;
-}
-
 struct TaskInQueue
 {
     Task* taskP;
@@ -145,27 +76,32 @@ struct TaskInQueue
 
 bool addTask(Task task)
 {
-/+
-    Task* taskP = cast(Task*) alloc.alloc(Task.sizeof);
-+/
-
-
     static currentQueue = 0;
-    scope(exit)
+
+    version (multi_try)
     {
-        if (++currentQueue >= queues.length)
-            currentQueue = 0;
-    }
+        auto maxAttempts = queues.length;
 
-    return (queues[currentQueue].push(&task));
-/+
+        bool succeses = false;
+        while(maxAttempts-- && !succeses)
+        {
+            succeses = queues[currentQueue].push(&task);
+            if (++currentQueue >= queues.length)
+                currentQueue = 0;
+        }
+
+        return succeses;
+    }
+    else
     {
+        scope(exit)
+        {
+            if (++currentQueue >= queues.length)
+                currentQueue = 0;
+        }
 
-        result = //TaskInQueue(TaskP, currentQueue);
+        return queues[currentQueue].push(&task);
     }
-
-    return result;
-+/
 }
 
 align(16) struct TaskQueue {
@@ -216,6 +152,19 @@ align(16) struct TaskQueue {
     bool push(Task* task, int n = 1) shared
     {
         mixin(zoneMixin("push"));
+
+        // as an optimisation we check for an full queue first
+        {
+            const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
+            const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
+            // printf("before pull -- readP: %d, writeP: %d\n", readP, writeP);
+            // update readP and writeP
+            if (readP == writeP + 1)
+            {
+                return false;
+            }
+        }
+
         Ticket ticket;
         {
             ticket = queueLock.drawTicket();
@@ -353,11 +302,23 @@ enum threadproc;
     mixin(zoneMixin("watcherTime"));
 
     uint lastCompletedTasks;
+    uint no_progress;
 
-    while((lastCompletedTasks = atomicLoad(completedTasks)) < 10_000)
+    while((lastCompletedTasks = atomicLoad!(MemoryOrder.raw)(completedTasks)) < 10_000)
     {
         ___tracy_emit_plot("completedTasks", lastCompletedTasks);
         Thread.sleep(1.usecs);
+        if (lastCompletedTasks == atomicLoad!(MemoryOrder.raw)(completedTasks))
+        {
+            if (no_progress++ > 1000)
+            {
+                // if the above is true we went an entire millisecond without making any progress
+                printf("Aborting due to lack of progress\n");
+                break;
+            }
+        }
+        else
+            no_progress = 0;
     }
     // you have half a second.
     {
@@ -433,6 +394,7 @@ shared TicketCounter globalLock;
 
         if (!execFiber)
         {
+            mixin(zoneMixin("FindNextFiber"));
             //printf("no new task ... searching for fiber to exec -- %llx\n", fiberPool.freeBitfield);
             // if we didn't add a task just now chose a random fiber to exec
             const nonFree = ~fiberPool.freeBitfield;
@@ -441,7 +403,6 @@ shared TicketCounter globalLock;
             // make sure the fiber we chose is used
             for(;;)
             {
-                mixin(zoneMixin("FindNextFiber"));
                 nextExecMask = 1UL << localNextIdx;
                 if (nextExecMask & nonFree)
                 {
@@ -452,7 +413,7 @@ shared TicketCounter globalLock;
                 localNextIdx = (++localNextIdx & 63);
             }
         }
-         ___tracy_emit_plot(worker_name.ptr, fiberPool.freeBitfield);
+        //___tracy_emit_plot(worker_name.ptr, fiberPool.freeBitfield);
         // execute a fiber in the pool
         {
             mixin(zoneMixin("FiberExecution"));
@@ -466,7 +427,7 @@ shared TicketCounter globalLock;
                 // printf("We just completed a task on fiberIdx: %p\n", &execFiber.idx);
                 atomicOp!"+="(completedTasks, 1);
                 execFiber.hasTask = false;
-
+                printf("freeing fiber\n");
                 fiberPool.free(&execFiber);
                 execFiber.reset();
 
@@ -476,10 +437,19 @@ shared TicketCounter globalLock;
 }
 shared int completedTasks;
 
-void main(string[] args)
+version (MARS) {}
+else
+{
+    void main(string[] args)
+    {
+        return fluffy_main(args);
+    }
+}
+
+void  fluffy_main(string[] args)
 {
     mixin(zoneMixin("Main"));
-     
+
     import core.memory;
     GC.disable();
 
@@ -530,7 +500,7 @@ void main(string[] args)
 
     string fName = "a";
     string[] result;
-    addTask(Task(&loadFiles, cast(shared void*)&fName, false));
+    // addTask(Task(&loadFiles, cast(shared void*)&fName, false));
     // printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
     // Thread.sleep(msecs(100));
 

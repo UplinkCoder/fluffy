@@ -7,6 +7,8 @@ import core.atomic;
 import core.thread.myFiber;
 import fluffy.ticket;
 
+alias task_function_t = void function (Task*);
+
 class TaskFiber : Fiber
 {
     /*tls*/ static bool initLoop;
@@ -28,7 +30,7 @@ class TaskFiber : Fiber
         if (hasTask)
         {
             assert(state() != State.TERM, "Attempting to start a finished task");
-            currentTask.fn(currentTask.taskData);
+            currentTask.fn(&currentTask);
             {
                 // string s = stateToString(state());
                 // printf("Task state after calling fn: %s\n", s.ptr);
@@ -151,10 +153,13 @@ struct FiberPool
     }
 }
 
-shared struct Task
+struct Task
 {
-    void function (shared void*) fn;
+    task_function_t fn;
     shared (void*) taskData;
+
+    align(16) shared TicketCounter taskLock;
+
     bool isBackgroundTask;
 
     shared Task*[] children;
@@ -163,10 +168,9 @@ shared struct Task
     uint queueID;
 
     shared (TaskFiber)* currentFiber;
-    align(16) shared bool hasCompleted_ = false;
-    align(16) shared bool hasFiber = false;
-    align(16) shared bool fiberIsExecuting = false;
-    align(16) shared TicketCounter taskLock;
+    shared bool hasCompleted_ = false;
+    shared bool hasFiber = false;
+    shared bool fiberIsExecuting = false;
 
     Ticket creation_ticket;
     uint completion_attempts;
