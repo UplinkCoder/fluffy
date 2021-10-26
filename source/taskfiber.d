@@ -130,9 +130,8 @@ struct FiberPool
         return fibers[0] !is null;
     }
     
-    void free(TaskFiber* fiber, int line = __LINE__)
+    void free(TaskFiber* fiber)
     {
-        printf("freeing fiber: %p (idx:%d) from: %d\n", *fiber, fiber.idx, line);
         assert(!fiber.hasTask);
         const fiberIdx = fiber.idx;
         assert(fiberIdx < fibers.length);

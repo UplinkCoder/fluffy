@@ -1,5 +1,3 @@
-
-
 import core.memory : GC;
 import fluffy.taskfiber;
 import fluffy.ticket;
@@ -13,6 +11,8 @@ static if (0)
 else
 {
     extern (C) void ___tracy_set_thread_name( const char* name ) {}
+    extern (C) void ___tracy_emit_plot ( const char* name, double value ) {}
+
 
     string zoneMixin(string zoneName)
     {
@@ -89,17 +89,10 @@ void loadFiles(shared void* arg)
             MmFile fluff_file = MmFile(*fArg);
             assert(Fiber.getThis());
             const text = cast(string)fluff_file.opSlice[];
+            bool yieldOnNextWord = false;
             // printf("loading complete, text: %s\n", text.ptr);
             foreach(line;text.splitter('\n'))
             {
-                if (auto fib = Fiber.getThis())
-                {
-                    // ___tracy_emit_message("We should yield", "We should yield".length, 0);
-                    // printf("Yield\n");
-                    fib.yield();
-                    // we yield because presumably someone else wants to execute as well
-                }
-
                 bool loadNext = false;
                 foreach(word;line.splitter(' '))
                 {
@@ -117,12 +110,23 @@ void loadFiles(shared void* arg)
                             string[] sResult;
                             auto ptr = cast(shared void*) pushString(word);
                             addTask(Task(&loadFiles, ptr));
-
+                            yieldOnNextWord = true;
                         }
                     }
                     else
                     {
                         //if (words.)
+                        if (yieldOnNextWord)
+                        {
+                            if (auto fib = Fiber.getThis())
+                            {
+                                fib.yield();
+                                yieldOnNextWord = false;
+                                // ___tracy_emit_message("We should yield", "We should yield".length, 0);
+                                // printf("Yield\n");
+                                // we yield because presumably someone else wants to execute as well
+                            }
+                        }
                     }
                 }
             }
@@ -352,7 +356,7 @@ enum threadproc;
 
     while((lastCompletedTasks = atomicLoad(completedTasks)) < 10_000)
     {
-        // ___tracy_emit_plot("completedTasks", lastCompletedTasks);
+        ___tracy_emit_plot("completedTasks", lastCompletedTasks);
         Thread.sleep(1.usecs);
     }
     // you have half a second.
@@ -448,7 +452,7 @@ shared TicketCounter globalLock;
                 localNextIdx = (++localNextIdx & 63);
             }
         }
-        // ___tracy_emit_plot(worker_name.ptr, myQueue.tasksInQueue(true));
+         ___tracy_emit_plot(worker_name.ptr, fiberPool.freeBitfield);
         // execute a fiber in the pool
         {
             mixin(zoneMixin("FiberExecution"));
@@ -459,7 +463,7 @@ shared TicketCounter globalLock;
             // if this completed the fiber we need to to reset it and send it back to the pool
             if (execFiber.state() == execFiber.state().TERM)
             {
-                printf("We just completed a task on fiberIdx: %p\n", &execFiber.idx);
+                // printf("We just completed a task on fiberIdx: %p\n", &execFiber.idx);
                 atomicOp!"+="(completedTasks, 1);
                 execFiber.hasTask = false;
 
