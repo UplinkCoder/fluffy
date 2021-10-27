@@ -4,6 +4,9 @@ import fluffy.ticket;
 import core.thread;
 import core.atomic;
 import core.stdc.stdio;
+import core.sys.posix.signal : timespec;
+import core.sys.posix.time;
+import core.time;
 version (tracy)
 {
     import tracy;
@@ -22,6 +25,14 @@ else
 }
 static  immutable task_function_t terminationDg =
     (Task*) { };
+
+
+void micro_sleep(uint micros)
+{
+    timespec ts;
+    ts.tv_nsec = micros * 1000;
+    nanosleep(&ts, null);
+}
 
 
 struct Alloc
@@ -417,13 +428,14 @@ shared bool killTheWatcher = false;
     TracyMessage("Watcher says Hello!");
     while(!atomicLoad(killTheWatcher))
     {
+        lastCompletedTasks = atomicLoad!(MemoryOrder.raw)(completedTasks);
         ___tracy_emit_plot("completedTasks", lastCompletedTasks);
         foreach(i; 0 .. workers.length)
         {
             ___tracy_emit_plot(worker_queue_strings[i].ptr, queues[i].tasksInQueue);
         }
 
-        Thread.sleep(1.usecs);
+        micro_sleep(1);
     }
     // you have half a second.
     {
@@ -505,7 +517,7 @@ shared TicketCounter globalLock;
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
                 // printf("Queue empty ... let's sleep\n");
-                Thread.sleep(1.usecs);
+                micro_sleep(2);
                 continue;
             }
         }
@@ -661,7 +673,7 @@ void  fluffy_main(string[] args)
         while(!addTask(&workMaker))
         {
             mixin(zoneMixin("waiting for queue to empty"));
-            Thread.sleep(1.usecs);
+            micro_sleep(1);
         }
     }
 
@@ -669,7 +681,7 @@ void  fluffy_main(string[] args)
         mixin(zoneMixin("Worker-Time"));
         foreach(i; 0 .. workers.length)
         {
-            Thread.sleep(500.msecs);
+            micro_sleep(500 * 1000);
         }
 
         atomicStore(killTheWatcher, true);
@@ -680,5 +692,5 @@ void  fluffy_main(string[] args)
 
 //    assert(sum == 10_000 * 12 * 1440);
 
-    printf("completedTasks: %llu\n", completedTasks);
+    printf("completedTasks: %llu\n", atomicLoad!(MemoryOrder.raw)(completedTasks));
 }
