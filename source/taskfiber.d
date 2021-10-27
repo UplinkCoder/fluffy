@@ -73,7 +73,7 @@ struct FiberPool
     TaskFiber[freeBitfield.sizeof * 8] fibers = null;
     void* fiberPoolStorage = null;
     
-    uint freeBitfield = ~0;
+    uint freeBitfield = (~0);
     
     static immutable INVALID_FIBER_IDX = 0;
     

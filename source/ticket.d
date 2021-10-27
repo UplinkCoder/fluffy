@@ -18,9 +18,16 @@ struct TicketCounter
     bool mutex_inited = false;
     pthread_mutex_t mutex;
 @nogc: nothrow:
-    shared align(16) uint nextTicket = 0;
-    shared align(16) uint currentlyServing;
-
+    version (no_sync)
+    {
+        uint nextTicket = 0;
+        uint currentlyServing;
+    }
+    else
+    {
+        shared align(16) uint nextTicket = 0;
+        shared align(16) uint currentlyServing;
+    }
 
     Loc lastAquiredLoc;
     struct Loc
@@ -33,39 +40,60 @@ struct TicketCounter
 
     Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
-        if (cas(&mutex_inited, false, true))
-        {
-            pthread_mutex_init(cast(pthread_mutex_t*)&mutex, null);
-        }
         pragma(inline, true);
-        __itt_sync_prepare(cast(void*) &this);
-        return Ticket(atomicOp!"+="(nextTicket, 1) - 1);
+        version (no_sync)
+        {
+            auto newTicket = nextTicket + 1;
+            nextTicket = newTicket;
+            return Ticket(nextTicket - 1);
+        }
+        else
+        {
+            if (cas(&mutex_inited, false, true))
+            {
+                // pthread_mutex_init(cast(pthread_mutex_t*)&mutex, null);
+            }
+            __itt_sync_prepare(cast(void*) &this);
+            return Ticket(atomicOp!"+="(nextTicket, 1) - 1);
+        }
     }
 
     void releaseTicket(Ticket ticket) shared
     {
         pragma(inline, true);
-
-        lastAquiredLoc = Loc("free","free", 0);
-        __itt_sync_releasing(cast(void*) &this);
-        atomicOp!"+="(currentlyServing, 1);
-        pthread_mutex_unlock(&mutex);
+        version (no_sync) 
+        {
+            auto currentlyServing_ = currentlyServing + 1;
+            currentlyServing = currentlyServing_;
+        }
+        else
+        {
+            lastAquiredLoc = Loc("free","free", 0);
+            __itt_sync_releasing(cast(void*) &this);
+            atomicOp!"+="(currentlyServing, 1);
+            // pthread_mutex_unlock(&mutex);
+        }
     }
 
     bool servingMe(Ticket ticket, string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
         pragma(inline, true);
-
-        auto result = pthread_mutex_trylock(&mutex) == 0;
-/+
-        auto result = atomicLoad(currentlyServing) == ticket.ticket;
-        if (result)
+        version (no_sync)
         {
-            __itt_sync_acquired(cast(void*) &this);
-            lastAquiredLoc = Loc(func, file, line);
+            return currentlyServing == ticket.ticket;
         }
-+/       
-        return result;
+        else
+        {
+            //auto result = pthread_mutex_trylock(&mutex) == 0;
+            auto result = atomicLoad(currentlyServing) == ticket.ticket;
+            if (result)
+            {
+
+                __itt_sync_acquired(cast(void*) &this);
+                lastAquiredLoc = Loc(func, file, line);
+            }
+            return result;
+        }
     }
 
     void redrawTicket(ref Ticket ticket, string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared

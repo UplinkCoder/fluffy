@@ -492,7 +492,7 @@ shared TicketCounter globalLock;
                     TracyMessage(*terminationMessage);
                     foreach(fIdx; 0 .. fiberPool.fibers.length)
                     {
-                        printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, fiberExecCount[fIdx]);
+                        // printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, fiberExecCount[fIdx]);
                     }
                     break;
                 }
@@ -513,9 +513,10 @@ shared TicketCounter globalLock;
         if (!execFiber)
         {
             mixin(zoneMixin("FindNextFiber"));
-            //printf("no new task ... searching for fiber to exec -- %llx\n", fiberPool.freeBitfield);
+            printf("no new task ... searching for fiber to exec -- %llx\n", fiberPool.freeBitfield);
+            printf("n_used: %d\n", fiberPool.n_used);
             // if we didn't add a task just now chose a random fiber to exec
-            const nonFree = ~fiberPool.freeBitfield;
+            const nonFree = (~fiberPool.freeBitfield);
             ulong nextExecMask;
             auto localNextIdx = nextExecIdx & (fiberPool.fibers.length - 1);
             // make sure the fiber we chose is used
@@ -648,13 +649,13 @@ void  fluffy_main(string[] args)
     shared ulong sum;
     shared TicketCounter sumSync;
     auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : 1024 };
+    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : 1440 };
 
     // now we can push the work!
     auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
     printf("sum before addnig tasks: %llu\n", sum);
 
-    foreach(_;0 .. 32)
+    foreach(_;0 .. 12)
     {
         // we need to loop on addTask because we might haven't got the chacne to schdule it
         while(!addTask(&workMaker))
@@ -668,16 +669,16 @@ void  fluffy_main(string[] args)
         mixin(zoneMixin("Worker-Time"));
         foreach(i; 0 .. workers.length)
         {
-            Thread.sleep(200.msecs);
+            Thread.sleep(500.msecs);
         }
 
         atomicStore(killTheWatcher, true);
     }
 
     printf("sum: %llu\n", sum);
-    printf("expected: %llu\n", cast(ulong) (10_000 * 32 * 32));
+    printf("expected: %llu\n", cast(ulong) (10_000 * 12 * 1440));
 
-//    assert(sum == 10_000 * 32 * 32);
+//    assert(sum == 10_000 * 12 * 1440);
 
     printf("completedTasks: %llu\n", completedTasks);
 }
