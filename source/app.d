@@ -75,6 +75,8 @@ struct TaskInQueue
     uint queueIndex;
 }
 
+extern (C) void breakpoint () {}
+
 bool addTask(Task* task)
 {
     mixin(zoneMixin("addTask"));
@@ -158,14 +160,17 @@ align(16) struct TaskQueue {
         if (tasksInQueue() > (queue.length - 4))
             return false;
 
-        auto terminationTask = Task(terminationDg, cast(shared void*)pushString(terminationMessage));
+        auto terminationTask = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
         return push(&terminationTask);
     }
 
     bool push(Task* task, int n = 1) shared
     {
         mixin(zoneMixin("push"));
-
+        if (task.fn is terminationDg)
+        {
+            printf("pushing termination\n");
+        }
         // as an optimisation we check for an full queue first
         {
             const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
@@ -218,6 +223,11 @@ align(16) struct TaskQueue {
             {
                 atomicOp!"+="(writePointer, 1);
             }
+        }
+        if (task.fn is terminationDg)
+        {
+            printf("Success .... termination accepted\n");
+            breakpoint;
         }
 
         return true;
@@ -352,14 +362,13 @@ struct WorkMarkerArgs
             TracyMessage("work_maker_continue");
         }
     }
-
 }
 @Task void countTaskFn(Task* task)
 {
     with (task)
     {
         int x = 0;
-        while(x++ != 10_000) {}
+        while(++x != 10_000) {}
 
 
         if (!syncLock)
@@ -389,17 +398,16 @@ struct WorkMarkerArgs
 shared bool killTheWatcher = false;
 @threadproc void watcherFunction ()
 {
-    __gshared static immutable(___tracy_source_location_data) loc_1509707097_392 = ___tracy_source_location_data("watcher__Time", "app.watcherFunction", "../fluffy/source/app.d", 392u, 0u);
-    immutable(___tracy_c_zone_context) ctx_1509707097_392 = ___tracy_emit_zone_begin_callstack(& loc_1509707097_392, 64, 1);
-
-    //mixin(zoneMixin("watcherTime"));
+    mixin(zoneMixin("watcherTime"));
     // who watches the watchman
     ___tracy_set_thread_name(`Watcher`);
 
     ulong lastCompletedTasks;
     uint no_progress;
 
-    char[32][] worker_queue_strings;
+    char[32]* queueStringMem = cast(char[32]*)alloc.alloc(32 * cast(uint)workers.length);
+    char[32][] worker_queue_strings = queueStringMem[0 .. workers.length];
+
     worker_queue_strings.length = workers.length;
     foreach(i, ref workerer_queue_string;worker_queue_strings)
     {
@@ -433,7 +441,6 @@ shared bool killTheWatcher = false;
         }
     }
     TracyMessage("Watcher says bye!");
-    ___tracy_emit_zone_end(ctx_1509707097_392);
 }
 
 shared TicketCounter globalLock;
@@ -450,6 +457,7 @@ shared TicketCounter globalLock;
     /*tls*/ shared (bool) *terminate = &workers[workerIndex].terminate;
     /*tls*/ shared(TaskQueue)* myQueue = &queues[workerIndex];
     /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
+    /*tls*/ int[fiberPool.fibers.length] fiberExecCount;
     {
         auto initTicket = globalLock.drawTicket();
 
@@ -482,6 +490,10 @@ shared TicketCounter globalLock;
                     auto terminationMessage = cast(string*) task.taskData;
                     ___tracy_emit_message("recieved termination signal", "recieved termination signal".length, 0);
                     TracyMessage(*terminationMessage);
+                    foreach(fIdx; 0 .. fiberPool.fibers.length)
+                    {
+                        printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, fiberExecCount[fIdx]);
+                    }
                     break;
                 }
                 execFiber = fiberPool.getNextFree();
@@ -491,6 +503,8 @@ shared TicketCounter globalLock;
             {
                 // no fibers used
                 mixin(zoneMixin("sleepnig"));
+                TaskQueue* q = cast(TaskQueue*)myQueue;
+                // printf("Queue empty ... let's sleep\n");
                 Thread.sleep(1.usecs);
                 continue;
             }
@@ -503,7 +517,7 @@ shared TicketCounter globalLock;
             // if we didn't add a task just now chose a random fiber to exec
             const nonFree = ~fiberPool.freeBitfield;
             ulong nextExecMask;
-            auto localNextIdx = nextExecIdx & 63;
+            auto localNextIdx = nextExecIdx & (fiberPool.fibers.length - 1);
             // make sure the fiber we chose is used
             for(;;)
             {
@@ -514,12 +528,13 @@ shared TicketCounter globalLock;
                     nextExecIdx++;
                     break;
                 }
-                localNextIdx = (++localNextIdx & 63);
+                localNextIdx = (++localNextIdx & (fiberPool.fibers.length - 1));
             }
         }
         //___tracy_emit_plot(worker_name.ptr, fiberPool.freeBitfield);
         // execute a fiber in the pool
         {
+            fiberExecCount[execFiber.idx]++;
             mixin(zoneMixin("FiberExecution"));
             //printf("executing fiber: %p -- idx:%d\n", execFiber, execFiber.idx);
             //printf("stateBeforeExec: %s\n", execFiber.stateToString(execFiber.state()).ptr);
@@ -528,7 +543,6 @@ shared TicketCounter globalLock;
             // if this completed the fiber we need to to reset it and send it back to the pool
             if (execFiber.state() == execFiber.state().TERM)
             {
-                // printf("We just completed a task on fiberIdx: %p\n", &execFiber.idx);
                 atomicOp!"+="(completedTasks, 1);
                 execFiber.hasTask = false;
                 fiberPool.free(execFiber);
@@ -559,7 +573,7 @@ void  fluffy_main(string[] args)
 
     import std.parallelism : totalCPUs;
     import core.stdc.stdlib;
-    alloc = cast(shared) Alloc(ushort.max * ushort.max);
+    alloc = cast(shared) Alloc(ushort.max);
 
     int n_workers;
 //    workers.length = totalCPUs - 1;
@@ -634,14 +648,16 @@ void  fluffy_main(string[] args)
     shared ulong sum;
     shared TicketCounter sumSync;
     auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : 200 };
+    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : 1024 };
 
     // now we can push the work!
     auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
-    foreach(_;0 .. 16)
+    printf("sum before addnig tasks: %llu\n", sum);
+
+    foreach(_;0 .. 32)
     {
         // we need to loop on addTask because we might haven't got the chacne to schdule it
-        while(!addTask(&counterTask))
+        while(!addTask(&workMaker))
         {
             mixin(zoneMixin("waiting for queue to empty"));
             Thread.sleep(1.usecs);
@@ -652,15 +668,16 @@ void  fluffy_main(string[] args)
         mixin(zoneMixin("Worker-Time"));
         foreach(i; 0 .. workers.length)
         {
-            Thread.sleep(500.msecs);
-            while (!queues[i].enqueueTermination("I just felt like it")) {}
-            (cast()workers[i].workerThread).join();
+            Thread.sleep(200.msecs);
         }
+
         atomicStore(killTheWatcher, true);
     }
-    // assert(sum == 10_000 * 16 * 200);
 
     printf("sum: %llu\n", sum);
+    printf("expected: %llu\n", cast(ulong) (10_000 * 32 * 32));
+
+//    assert(sum == 10_000 * 32 * 32);
 
     printf("completedTasks: %llu\n", completedTasks);
 }
