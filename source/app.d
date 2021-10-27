@@ -16,6 +16,7 @@ else
     extern (C) void ___tracy_set_thread_name( const char* name ) {}
     extern (C) void ___tracy_emit_plot ( const char* name, double value ) {}
     extern (C) void ___tracy_emit_message ( const char* name, size_t length, int callstack ) {}
+
     void TracyMessage(string message) {}
 
     string zoneMixin(string zoneName)
@@ -98,17 +99,12 @@ bool addTask(Task* task, uint myQueue = uint.max)
 
     shared static currentQueue = 0;
     uint pushIntoQueue = currentQueue;
-/+
-    static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (2f/3f));
+
+    static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (5f/6f));
     if (myQueue != uint.max && queues[myQueue].tasksInQueue() < queueCutOff)
     {
         pushIntoQueue = myQueue;
     }
-    else
-    {
-        pushIntoQueue = currentQueue;
-    }
-+/
 
     version (multi_try)
     {
@@ -143,8 +139,66 @@ align(16) struct TaskQueue {
     align(16) shared uint writePointer; // tail
 
     Task[1024]* queue;
-    /// a read pointer of -1 signifies the queue is empty
 
+    /// returns how many tasks have been stolen
+    /// this function will deposit the stolen items directly
+    /// into your queue
+    /// we will lock it for this purpose
+    uint steal(uint stealAmount, shared(TaskQueue)* thiefQueue, Ticket ticket) shared
+    {
+        // we can assume the thief has locked the queue;
+        // let's make sure though
+        assert(queueLock.currentlyServing == ticket.ticket, 
+            "Thief has not locked the queue");
+        Ticket thiefQueueTicket = thiefQueue.queueLock.drawTicket();
+        while (thiefQueue.queueLock.servingMe(thiefQueueTicket)) {}
+        import std.algorithm.comparison : min;
+     
+        uint stolen_items = min(stealAmount, tasksInQueue());
+        atomicFence();
+        {
+            scope(exit) queueLock.releaseTicket(thiefQueueTicket);
+            // we are locked so raw reads are fine
+            const victimReadP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
+            const victimWriteP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
+            if (victimReadP <= victimWriteP // writeP - readP = items ok 
+                || victimWriteP >= stolen_items // ignore wraparound if we don't steal across the boundry
+            )
+            {
+                // easy case we can just substract to get the number of items
+                auto begin_pos = cast(int) (victimWriteP - stolen_items);
+                assert(thiefQueue.push(cast(Task*)&((*queue)[begin_pos]), cast(int)(victimWriteP - begin_pos)));
+                // stealing renomalizes or pointers ... nice
+                atomicStore!(MemoryOrder.raw)(writePointer, begin_pos);
+            }
+            else
+            {
+                // not as easy we need to push in two steps
+                // first from writePointer to zero
+                int remaining = cast(int)(stolen_items - victimWriteP);
+                assert(thiefQueue.push(cast(Task*)&((*queue)[0]), victimWriteP));
+                int newWritePointer = cast(int)(queue.length - remaining);
+                assert(thiefQueue.push(cast(Task*)&((*queue)[newWritePointer]), remaining));
+                atomicStore!(MemoryOrder.raw)(writePointer, newWritePointer);
+            }
+            
+        }
+        atomicFence();
+
+        return stolen_items;
+    }
+
+    unittest
+    {
+        TaskQueue victim;
+        // victim.push()
+        TaskQueue thief;
+    }
+
+    bool isLocked()
+    {
+        return queueLock.nextTicket != queueLock.currentlyServing;
+    }
 
     int tasksInQueue(bool consistent = false) shared
     {
@@ -207,8 +261,6 @@ align(16) struct TaskQueue {
             }
         }
 
-        if (tasksInQueue() > 500)
-            return false;
 /+
         if (queueLock.apporxQueueLength > 7)
         {
@@ -350,26 +402,6 @@ extern (C) void ___tracy_set_thread_name( const char* name );
 
 enum threadproc;
 
-void sumTask(shared (ulong)* arg, shared (TicketCounter*) argLock)
-{
-    const argTicket = argLock.drawTicket();
-    {
-        while(!argLock.servingMe(argTicket)) {}
-        atomicFence();
-    }
-
-    {
-        arg += 10_000;
-    }
-
-    {
-        atomicFence();
-        argLock.releaseTicket(argTicket);
-    }
-
-}
-
-
 struct WorkMarkerArgs
 {
     Task* work;
@@ -384,14 +416,16 @@ struct WorkMarkerArgs
 
     foreach(_; 0 .. args.how_many)
     {
-        while(!addTask(args.work)) 
+        while(!addTask(args.work, task.queueID)) 
         {
             TracyMessage("work_maker_yield");
             task.currentFiber.yield();
             TracyMessage("work_maker_continue");
         }
     }
+    printf("WorkMaker done\n");
 }
+
 @Task void countTaskFn(Task* task)
 {
     with (task)
@@ -490,6 +524,8 @@ shared TicketCounter globalLock;
     /*tls*/ int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
     /*tls*/ char[16] worker_name;
     sprintf(&worker_name[0], "Worker %d", workerIndex);
+    printf("%s is starting\n", &worker_name[0]);
+
     ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
     /*tls*/ shared (bool) *terminate = &workers[workerIndex].terminate;
@@ -515,13 +551,13 @@ shared TicketCounter globalLock;
     /*tls*/ Task task;
 
     /*tls*/ static uint nextExecIdx;
-    while(!atomicLoad!(MemoryOrder.raw)(*terminate))
+    for(;;)
     {
         // mixin(zoneMixin("WorkerLoop"));
         TaskFiber execFiber;
         if (auto idx = fiberPool.nextFree())
         {
-            if ((myQueue.pull(&task)))
+            if (myQueue.pull(&task))
             {
                 if (task.fn is terminationDg)
                 {
@@ -530,7 +566,8 @@ shared TicketCounter globalLock;
                     TracyMessage(*terminationMessage);
                     foreach(fIdx; 0 .. fiberPool.fibers.length)
                     {
-                        // printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, fiberExecCount[fIdx]);
+                        const eCount = fiberExecCount[fIdx];
+                        if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
                     }
                     break;
                 }
@@ -542,9 +579,46 @@ shared TicketCounter globalLock;
                 // no fibers used
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
-                // printf("Queue empty ... let's sleep\n");
-                micro_sleep(2);
-                continue;
+                printf("Queue empty ... let's steal some work\n");
+
+                {
+                    uint max_queue_length = 0;
+                    int longest_queue_idx = -1;
+                    shared(TaskQueue)* victim;
+                    foreach(qIdx; 0 .. queues.length)
+                    {
+                        auto canidate = &queues[qIdx];
+                        auto canidate_n_tasks = canidate.tasksInQueue();
+                        if (canidate_n_tasks > max_queue_length)
+                        {
+                            victim = canidate;
+                            max_queue_length = canidate_n_tasks; 
+                        }
+                    }
+                    if (victim)
+                    {
+                        auto steal_amount = cast(int)(max_queue_length * (1f/3f));
+                        // lock the victim queue;
+                        const ticket = victim.queueLock.drawTicket();
+                        while(victim.queueLock.servingMe(ticket)) {}
+                        {
+                            atomicFence();
+                            scope(exit) victim.queueLock.releaseTicket(ticket);
+                            auto n_stolen = victim.steal(steal_amount, myQueue, ticket);
+                            atomicFence();
+                        }
+                        continue;
+                    }
+
+
+                    if (longest_queue_idx == -1)
+                    {
+                        // there's no-one to seal from
+                        // let's sleep and continue later
+                        micro_sleep(2);
+                        continue;
+                    }
+                }
             }
         }
 
@@ -685,7 +759,7 @@ void fluffy_main(string[] args)
     shared ulong sum;
     shared TicketCounter sumSync;
     auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-    enum task_multiplier = 1440;
+    enum task_multiplier = 128;
 
     WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : task_multiplier };
 
@@ -705,15 +779,24 @@ void fluffy_main(string[] args)
         }
     }
     micro_sleep(70);
+    const expected = cast(ulong) (10_000 * main_task_issues * task_multiplier);
+    printf("expected: %llu\n", expected);
+
+    ulong lastSum;
+    while((lastSum = atomicLoad(sum)) != expected)
+    {
+        micro_sleep(310);
+        printf("lastSum: %llu\n", lastSum);
+    }
+/+
     foreach(ref w;workers)
     {
         (cast()w.workerThread).join();
     }
-
++/
 
 
     printf("sum: %llu\n", sum);
-    printf("expected: %llu\n", cast(ulong) (10_000 * main_task_issues * task_multiplier));
 
 //    assert(sum == 10_000 * 12 * 1440);
 
