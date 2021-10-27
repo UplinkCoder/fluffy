@@ -29,15 +29,6 @@ struct TicketCounter
         shared align(16) uint currentlyServing;
     }
 
-    Loc lastAquiredLoc;
-    struct Loc
-    {
-        string func;
-        string file;
-        int line;
-    }
-    int n_waiters;
-
     Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
         pragma(inline, true);
@@ -51,7 +42,10 @@ struct TicketCounter
         {
             if (cas(&mutex_inited, false, true))
             {
-                // pthread_mutex_init(cast(pthread_mutex_t*)&mutex, null);
+                version (pmutex)
+                {
+                    pthread_mutex_init(cast(pthread_mutex_t*)&mutex, null);
+                }
             }
             __itt_sync_prepare(cast(void*) &this);
             return Ticket(atomicOp!"+="(nextTicket, 1) - 1);
@@ -68,10 +62,12 @@ struct TicketCounter
         }
         else
         {
-            lastAquiredLoc = Loc("free","free", 0);
             __itt_sync_releasing(cast(void*) &this);
             atomicOp!"+="(currentlyServing, 1);
-            // pthread_mutex_unlock(&mutex);
+            version (pmutex)
+            {
+                pthread_mutex_unlock(&mutex);
+            }
         }
     }
 
@@ -84,13 +80,17 @@ struct TicketCounter
         }
         else
         {
-            //auto result = pthread_mutex_trylock(&mutex) == 0;
-            auto result = atomicLoad(currentlyServing) == ticket.ticket;
+            version (pmutex)
+            {
+                auto result = pthread_mutex_trylock(&mutex) == 0;
+            }
+            else
+            {
+                auto result = atomicLoad(currentlyServing) == ticket.ticket;
+            }
             if (result)
             {
-
                 __itt_sync_acquired(cast(void*) &this);
-                lastAquiredLoc = Loc(func, file, line);
             }
             return result;
         }
