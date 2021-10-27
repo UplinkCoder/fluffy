@@ -178,10 +178,6 @@ align(16) struct TaskQueue {
     bool push(Task* task, int n = 1) shared
     {
         mixin(zoneMixin("push"));
-        if (task.fn is terminationDg)
-        {
-            printf("pushing termination\n");
-        }
         // as an optimisation we check for an full queue first
         {
             const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
@@ -201,8 +197,9 @@ align(16) struct TaskQueue {
 
         {
             mixin(zoneMixin("waiting"));
+            atomicFence!(MemoryOrder.seq)();
             while(!queueLock.servingMe(ticket)) {}
-            atomicFence();
+            atomicFence!(MemoryOrder.seq)();
         }
         // we've got the lock
         //printf("push Task\n");
@@ -227,6 +224,7 @@ align(16) struct TaskQueue {
             }
 
             {
+                mixin(zoneMixin("issue write"));
                 cast()(*queue)[writeP] = *task;
                 atomicFence!(MemoryOrder.seq)();
             }
@@ -234,11 +232,6 @@ align(16) struct TaskQueue {
             {
                 atomicOp!"+="(writePointer, 1);
             }
-        }
-        if (task.fn is terminationDg)
-        {
-            printf("Success .... termination accepted\n");
-            breakpoint;
         }
 
         return true;
@@ -407,6 +400,7 @@ struct WorkMarkerArgs
     }
 }
 shared bool killTheWatcher = false;
+shared uint expected_completions = uint.max;
 @threadproc void watcherFunction ()
 {
     mixin(zoneMixin("watcherTime"));
@@ -436,6 +430,8 @@ shared bool killTheWatcher = false;
         }
 
         micro_sleep(1);
+        if (lastCompletedTasks >= atomicLoad!(MemoryOrder.raw)(expected_completions))
+            break;
     }
     // you have half a second.
     {
@@ -458,6 +454,7 @@ shared bool killTheWatcher = false;
 shared TicketCounter globalLock;
 
 @threadproc void workerFunction () {
+    breakpoint();
     mixin(zoneMixin("workerFunction"));
 
     static shared int workerCounter;
@@ -525,8 +522,6 @@ shared TicketCounter globalLock;
         if (!execFiber)
         {
             mixin(zoneMixin("FindNextFiber"));
-            printf("no new task ... searching for fiber to exec -- %llx\n", fiberPool.freeBitfield);
-            printf("n_used: %d\n", fiberPool.n_used);
             // if we didn't add a task just now chose a random fiber to exec
             const nonFree = (~fiberPool.freeBitfield);
             ulong nextExecMask;
@@ -661,13 +656,17 @@ void  fluffy_main(string[] args)
     shared ulong sum;
     shared TicketCounter sumSync;
     auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : 1440 };
+    enum task_multiplier = 1440;
+
+    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : task_multiplier };
 
     // now we can push the work!
     auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
     printf("sum before addnig tasks: %llu\n", sum);
+    enum main_task_issues = 64;
+    atomicStore(expected_completions, (task_multiplier * main_task_issues) + main_task_issues);
 
-    foreach(_;0 .. 12)
+    foreach(_;0 .. main_task_issues)
     {
         // we need to loop on addTask because we might haven't got the chacne to schdule it
         while(!addTask(&workMaker))
@@ -676,19 +675,20 @@ void  fluffy_main(string[] args)
             micro_sleep(1);
         }
     }
+    micro_sleep(300 * 1000);
 
     {
         mixin(zoneMixin("Worker-Time"));
         foreach(i; 0 .. workers.length)
         {
-            micro_sleep(500 * 1000);
+
         }
 
-        atomicStore(killTheWatcher, true);
+
     }
 
     printf("sum: %llu\n", sum);
-    printf("expected: %llu\n", cast(ulong) (10_000 * 12 * 1440));
+    printf("expected: %llu\n", cast(ulong) (10_000 * main_task_issues * task_multiplier));
 
 //    assert(sum == 10_000 * 12 * 1440);
 
