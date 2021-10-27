@@ -4,7 +4,7 @@ import fluffy.ticket;
 import core.thread;
 import core.atomic;
 import core.stdc.stdio;
-static if (0)
+version (tracy)
 {
     import tracy;
 }
@@ -12,7 +12,8 @@ else
 {
     extern (C) void ___tracy_set_thread_name( const char* name ) {}
     extern (C) void ___tracy_emit_plot ( const char* name, double value ) {}
-
+    extern (C) void ___tracy_emit_message ( const char* name, size_t length, int callstack ) {}
+    void TracyMessage(string message) {}
 
     string zoneMixin(string zoneName)
     {
@@ -74,8 +75,9 @@ struct TaskInQueue
     uint queueIndex;
 }
 
-bool addTask(Task task)
+bool addTask(Task* task)
 {
+    mixin(zoneMixin("addTask"));
     static currentQueue = 0;
 
     version (multi_try)
@@ -85,7 +87,7 @@ bool addTask(Task task)
         bool succeses = false;
         while(maxAttempts-- && !succeses)
         {
-            succeses = queues[currentQueue].push(&task);
+            succeses = queues[currentQueue].push(task);
             if (++currentQueue >= queues.length)
                 currentQueue = 0;
         }
@@ -100,15 +102,15 @@ bool addTask(Task task)
                 currentQueue = 0;
         }
 
-        return queues[currentQueue].push(&task);
+        return queues[currentQueue].push(task);
     }
 }
 
 align(16) struct TaskQueue {
     align (16) shared TicketCounter queueLock;
 
-    align(16) shared int readPointer; // head
-    align(16) shared int writePointer; // tail
+    align(16) shared uint readPointer; // head
+    align(16) shared uint writePointer; // tail
 
     Task[1024]* queue;
     /// a read pointer of -1 signifies the queue is empty
@@ -129,9 +131,16 @@ align(16) struct TaskQueue {
         }
         const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
         const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
-        return cast(int)(writeP - readP);
-
-
+        if (writeP >= readP)
+        {
+            return cast(int)(writeP - readP);
+        }
+        else
+        {
+            // wrap-around
+            // we go from readP to length and from zero to writeP
+            return cast(int)((queue.length - readP) + writeP); 
+        }
     }
 
     void initQueue() shared
@@ -143,9 +152,13 @@ align(16) struct TaskQueue {
         queue = cast(typeof(queue))align16(cast(size_t)taskMemPtr);
     }
 
-    bool enqueueTermination() shared
+    bool enqueueTermination(string terminationMessage) shared
     {
-        auto terminationTask = Task(terminationDg);
+        // little guard to we don't push the message if the chance of success is low
+        if (tasksInQueue() > (queue.length - 4))
+            return false;
+
+        auto terminationTask = Task(terminationDg, cast(shared void*)pushString(terminationMessage));
         return push(&terminationTask);
     }
 
@@ -173,6 +186,7 @@ align(16) struct TaskQueue {
         {
             mixin(zoneMixin("waiting"));
             while(!queueLock.servingMe(ticket)) {}
+            atomicFence();
         }
         // we've got the lock
         //printf("push Task\n");
@@ -181,7 +195,7 @@ align(16) struct TaskQueue {
             const readP = atomicLoad(readPointer) & (queue.length - 1);
             const writeP = atomicLoad(writePointer) & (queue.length - 1);
             // update readP and writeP
-            auto tasksFit = queue.length - tasksInQueue();
+            auto tasksFit = queue.length - (cast(int)(writeP - readP));
             if (n > queue.length / 2)
             {
                 assert(0, "this many tasks can never fit");
@@ -234,6 +248,7 @@ align(16) struct TaskQueue {
         {
             //mixin(zoneMixin("wating on mutex"));
             while(!queueLock.servingMe(ticket)) {}
+            atomicFence!();
         }
 
         {
@@ -287,6 +302,7 @@ shared TaskQueue[] queues = void;
 struct Worker
 {
     Thread workerThread;
+    shared bool terminate;
     FiberPool workerFiberPool;
 }
 
@@ -295,79 +311,167 @@ extern (C) void ___tracy_set_thread_name( const char* name );
 
 enum threadproc;
 
+void sumTask(shared (ulong)* arg, shared (TicketCounter*) argLock)
+{
+    const argTicket = argLock.drawTicket();
+    {
+        while(!argLock.servingMe(argTicket)) {}
+        atomicFence();
+    }
+
+    {
+        arg += 10_000;
+    }
+
+    {
+        atomicFence();
+        argLock.releaseTicket(argTicket);
+    }
+
+}
+
+
+struct WorkMarkerArgs
+{
+    Task* work;
+    uint how_many;
+}
+
+@Task void workMakerFn(Task* task)
+{
+    TracyMessage("workMakerFn");
+
+    auto args = cast(WorkMarkerArgs*) task.taskData;
+
+    foreach(_; 0 .. args.how_many)
+    {
+        while(!addTask(args.work)) 
+        {
+            TracyMessage("work_maker_yield");
+            task.currentFiber.yield();
+            TracyMessage("work_maker_continue");
+        }
+    }
+
+}
+@Task void countTaskFn(Task* task)
+{
+    with (task)
+    {
+        int x = 0;
+        while(x++ != 10_000) {}
+
+
+        if (!syncLock)
+        {
+            assert(0, "The countTask needs a syncLock! since it has shared result");
+        }
+        const syncResultTicket = syncLock.drawTicket();
+
+        {
+            mixin(zoneMixin("waiting on result sync"));
+            while(!syncLock.servingMe(syncResultTicket)) {}
+            atomicFence();
+        }
+
+        {
+            // not shared because we aquired the lock
+            auto sumP = cast(ulong*) task.taskData;
+            (*sumP) += x;
+        }
+
+        {
+            atomicFence();
+            syncLock.releaseTicket(syncResultTicket);
+        }
+    }
+}
+shared bool killTheWatcher = false;
 @threadproc void watcherFunction ()
 {
+    __gshared static immutable(___tracy_source_location_data) loc_1509707097_392 = ___tracy_source_location_data("watcher__Time", "app.watcherFunction", "../fluffy/source/app.d", 392u, 0u);
+    immutable(___tracy_c_zone_context) ctx_1509707097_392 = ___tracy_emit_zone_begin_callstack(& loc_1509707097_392, 64, 1);
+
+    //mixin(zoneMixin("watcherTime"));
     // who watches the watchman
     ___tracy_set_thread_name(`Watcher`);
-    mixin(zoneMixin("watcherTime"));
 
-    uint lastCompletedTasks;
+    ulong lastCompletedTasks;
     uint no_progress;
 
-    while((lastCompletedTasks = atomicLoad!(MemoryOrder.raw)(completedTasks)) < 10_000)
+    char[32][] worker_queue_strings;
+    worker_queue_strings.length = workers.length;
+    foreach(i, ref workerer_queue_string;worker_queue_strings)
+    {
+        sprintf(workerer_queue_string.ptr, "queue %d\0", cast(int) i);
+    }
+
+    TracyMessage("Watcher says Hello!");
+    while(!atomicLoad(killTheWatcher))
     {
         ___tracy_emit_plot("completedTasks", lastCompletedTasks);
-        Thread.sleep(1.usecs);
-        if (lastCompletedTasks == atomicLoad!(MemoryOrder.raw)(completedTasks))
+        foreach(i; 0 .. workers.length)
         {
-            if (no_progress++ > 1000)
-            {
-                // if the above is true we went an entire millisecond without making any progress
-                printf("Aborting due to lack of progress\n");
-                break;
-            }
+            ___tracy_emit_plot(worker_queue_strings[i].ptr, queues[i].tasksInQueue);
         }
-        else
-            no_progress = 0;
+
+        Thread.sleep(1.usecs);
     }
     // you have half a second.
     {
-        mixin(zoneMixin("enqueueingTermnination"));
+        printf("watcher: enquing termination\n");
+        mixin(zoneMixin("watcher: enqueueingTermnination"));
         foreach(i; 0 .. workers.length)
         {
+            printf("termination for worker %d ... ", cast(int)i);
             bool enqueuedTermination = false;
             while(!enqueuedTermination)
             {
-                enqueuedTermination = queues[i].enqueueTermination();
-            };
+                enqueuedTermination = queues[i].enqueueTermination("Watcher termination");
+            }
+            printf("Termination scheduled\n");
         }
     }
+    TracyMessage("Watcher says bye!");
+    ___tracy_emit_zone_end(ctx_1509707097_392);
 }
 
 shared TicketCounter globalLock;
 
 @threadproc void workerFunction () {
+    mixin(zoneMixin("workerFunction"));
+
     static shared int workerCounter;
     /*tls*/ int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
     /*tls*/ char[16] worker_name;
     sprintf(&worker_name[0], "Worker %d", workerIndex);
     ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
+    /*tls*/ shared (bool) *terminate = &workers[workerIndex].terminate;
     /*tls*/ shared(TaskQueue)* myQueue = &queues[workerIndex];
     /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
     {
         auto initTicket = globalLock.drawTicket();
 
-        atomicFence();
-        while (!globalLock.servingMe(initTicket)) {}
-
-        atomicFence();
+        {
+            while (!globalLock.servingMe(initTicket)) {}
+            atomicFence();
+        }
         /*tls*/ fiberPool.initFiberPool();
-
-        atomicFence();
-        globalLock.releaseTicket(initTicket);
+        {
+            atomicFence();
+            globalLock.releaseTicket(initTicket);
+        }
     }
 
 
-
-    /*tls*/ bool terminate = false;
     /*tls*/ int myCounter = 0;
     /*tls*/ Task task;
 
     /*tls*/ static uint nextExecIdx;
-    while(!terminate)
+    while(!atomicLoad!(MemoryOrder.raw)(*terminate))
     {
-        mixin(zoneMixin("WorkerLoop"));
+        // mixin(zoneMixin("WorkerLoop"));
         TaskFiber execFiber;
         if (auto idx = fiberPool.nextFree())
         {
@@ -375,13 +479,13 @@ shared TicketCounter globalLock;
             {
                 if (task.fn is terminationDg)
                 {
-                    terminate = true;
-                    // TracyMessage("recieved termination signal");
+                    auto terminationMessage = cast(string*) task.taskData;
+                    ___tracy_emit_message("recieved termination signal", "recieved termination signal".length, 0);
+                    TracyMessage(*terminationMessage);
+                    break;
                 }
-
                 execFiber = fiberPool.getNextFree();
                 execFiber.assignTask(&task);
-                //task.result = task.fn(task.taskData);
             }
             else if (!fiberPool.n_used)
             {
@@ -427,15 +531,15 @@ shared TicketCounter globalLock;
                 // printf("We just completed a task on fiberIdx: %p\n", &execFiber.idx);
                 atomicOp!"+="(completedTasks, 1);
                 execFiber.hasTask = false;
-                printf("freeing fiber\n");
-                fiberPool.free(&execFiber);
+                fiberPool.free(execFiber);
                 execFiber.reset();
 
             }
         }
     }
+    TracyMessage("Goobye!");
 }
-shared int completedTasks;
+shared ulong completedTasks;
 
 version (MARS) {}
 else
@@ -497,6 +601,7 @@ void  fluffy_main(string[] args)
         }
     }
 
+    printf("All workers are initialized\n");
 
     string fName = "a";
     string[] result;
@@ -507,7 +612,6 @@ void  fluffy_main(string[] args)
     // task should now be in queue zero
     // printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
 
-    printf("All workers are initialized\n");
     // all need be initted before we start them
     {
         mixin(zoneMixin("threadStartup"));
@@ -516,17 +620,47 @@ void  fluffy_main(string[] args)
             (cast()workers[i].workerThread).start();
         }
     }
+
     // fire up the watcher which terminates the threads
+    // before we push tasks since it also reports stats
     auto watcher = new Thread(&watcherFunction, 128);
     watcher.start();
+    scope (exit)
+    {
+        watcher.join();
+    }
+
+
+    shared ulong sum;
+    shared TicketCounter sumSync;
+    auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
+    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : 200 };
+
+    // now we can push the work!
+    auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
+    foreach(_;0 .. 16)
+    {
+        // we need to loop on addTask because we might haven't got the chacne to schdule it
+        while(!addTask(&counterTask))
+        {
+            mixin(zoneMixin("waiting for queue to empty"));
+            Thread.sleep(1.usecs);
+        }
+    }
 
     {
         mixin(zoneMixin("Worker-Time"));
         foreach(i; 0 .. workers.length)
         {
+            Thread.sleep(500.msecs);
+            while (!queues[i].enqueueTermination("I just felt like it")) {}
             (cast()workers[i].workerThread).join();
         }
+        atomicStore(killTheWatcher, true);
     }
-    watcher.join();
-    printf("completedTasks: %d\n", completedTasks);
+    // assert(sum == 10_000 * 16 * 200);
+
+    printf("sum: %llu\n", sum);
+
+    printf("completedTasks: %llu\n", completedTasks);
 }

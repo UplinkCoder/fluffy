@@ -132,7 +132,7 @@ struct FiberPool
         return fibers[0] !is null;
     }
     
-    void free(TaskFiber* fiber)
+    void free(TaskFiber fiber)
     {
         assert(!fiber.hasTask);
         const fiberIdx = fiber.idx;
@@ -157,6 +157,8 @@ struct Task
 {
     task_function_t fn;
     shared (void*) taskData;
+
+    shared (TicketCounter)* syncLock;
 
     align(16) shared TicketCounter taskLock;
 
