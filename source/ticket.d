@@ -29,6 +29,11 @@ struct TicketCounter
         shared align(16) uint currentlyServing;
     }
 
+    uint apporxQueueLength() shared
+    {
+        return currentlyServing - nextTicket;
+    }
+
     Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
     {
         pragma(inline, true);
@@ -63,6 +68,7 @@ struct TicketCounter
         else
         {
             __itt_sync_releasing(cast(void*) &this);
+            assert(currentlyServing == ticket.ticket);
             atomicOp!"+="(currentlyServing, 1);
             version (pmutex)
             {

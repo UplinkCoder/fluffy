@@ -54,13 +54,17 @@ struct Alloc
     {
         auto ticket = allocLock.drawTicket();
         while (!allocLock.servingMe(ticket)) {}
+
+        atomicFence!(MemoryOrder.seq)();
         scope(exit) allocLock.releaseTicket(ticket);
 
         sz = cast(uint)align16(sz);
         assert(capacity_remaining > sz);
-        ubyte* result = cast(ubyte*)(memPtr + sz);
+        ubyte* result = cast(ubyte*)(memPtr);
         (cast()memPtr) += sz;
         (cast()capacity_remaining) -= sz;
+
+        atomicFence!(MemoryOrder.seq)();
         return result;
     }
 }
@@ -88,10 +92,23 @@ struct TaskInQueue
 
 extern (C) void breakpoint () {}
 
-bool addTask(Task* task)
+bool addTask(Task* task, uint myQueue = uint.max)
 {
     mixin(zoneMixin("addTask"));
-    static currentQueue = 0;
+
+    shared static currentQueue = 0;
+    uint pushIntoQueue = currentQueue;
+/+
+    static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (2f/3f));
+    if (myQueue != uint.max && queues[myQueue].tasksInQueue() < queueCutOff)
+    {
+        pushIntoQueue = myQueue;
+    }
+    else
+    {
+        pushIntoQueue = currentQueue;
+    }
++/
 
     version (multi_try)
     {
@@ -111,11 +128,11 @@ bool addTask(Task* task)
     {
         scope(exit)
         {
-            if (++currentQueue >= queues.length)
+            if (atomicOp!"+="(currentQueue, 1) >= queues.length)
                 currentQueue = 0;
         }
 
-        return queues[currentQueue].push(task);
+        return queues[pushIntoQueue].push(task);
     }
 }
 
@@ -190,6 +207,14 @@ align(16) struct TaskQueue {
             }
         }
 
+        if (tasksInQueue() > 500)
+            return false;
+/+
+        if (queueLock.apporxQueueLength > 7)
+        {
+            return false;
+        }
++/
         Ticket ticket;
         {
             ticket = queueLock.drawTicket();
@@ -426,15 +451,19 @@ shared uint expected_completions = uint.max;
         ___tracy_emit_plot("completedTasks", lastCompletedTasks);
         foreach(i; 0 .. workers.length)
         {
-            ___tracy_emit_plot(worker_queue_strings[i].ptr, queues[i].tasksInQueue);
+            ___tracy_emit_plot(worker_queue_strings[i].ptr, queues[i].tasksInQueue());
         }
 
         micro_sleep(1);
         if (lastCompletedTasks >= atomicLoad!(MemoryOrder.raw)(expected_completions))
             break;
     }
-    // you have half a second.
+    // giving tasks 5 microseconds to take care of unfinished buissness
+    micro_sleep(5);
+
     {
+        printf("lastCompletedTasks -- %llu -- expected_completions %llu", 
+            lastCompletedTasks, atomicLoad!(MemoryOrder.raw)(expected_completions));
         printf("watcher: enquing termination\n");
         mixin(zoneMixin("watcher: enqueueingTermnination"));
         foreach(i; 0 .. workers.length)
@@ -572,7 +601,7 @@ else
     }
 }
 
-void  fluffy_main(string[] args)
+void fluffy_main(string[] args)
 {
     mixin(zoneMixin("Main"));
 
@@ -663,7 +692,7 @@ void  fluffy_main(string[] args)
     // now we can push the work!
     auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
     printf("sum before addnig tasks: %llu\n", sum);
-    enum main_task_issues = 64;
+    enum main_task_issues = 32;
     atomicStore(expected_completions, (task_multiplier * main_task_issues) + main_task_issues);
 
     foreach(_;0 .. main_task_issues)
@@ -675,17 +704,13 @@ void  fluffy_main(string[] args)
             micro_sleep(1);
         }
     }
-    micro_sleep(300 * 1000);
-
+    micro_sleep(70);
+    foreach(ref w;workers)
     {
-        mixin(zoneMixin("Worker-Time"));
-        foreach(i; 0 .. workers.length)
-        {
-
-        }
-
-
+        (cast()w.workerThread).join();
     }
+
+
 
     printf("sum: %llu\n", sum);
     printf("expected: %llu\n", cast(ulong) (10_000 * main_task_issues * task_multiplier));
