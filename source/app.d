@@ -122,12 +122,10 @@ bool addTask(Task* task, uint myQueue = uint.max)
     }
     else
     {
-        scope(exit)
+        if (pushIntoQueue >= queues.length)
         {
-            if (atomicOp!"+="(currentQueue, 1) >= queues.length)
-                currentQueue = 0;
+            pushIntoQueue = 0;
         }
-
         return queues[pushIntoQueue].push(task);
     }
 }
@@ -148,6 +146,11 @@ align(16) struct TaskQueue {
     {
         // we can assume the thief has locked the queue;
         // let's make sure though
+        if (queueLock.currentlyServing != ticket.ticket)
+        {
+            printf("queueLock not held by theif? -- thiefTicket: %d -- currentlyServing: %d",
+                ticket.ticket, queueLock.currentlyServing);
+        }
         assert(queueLock.currentlyServing == ticket.ticket, 
             "Thief has not locked the queue");
         Ticket thiefQueueTicket = thiefQueue.queueLock.drawTicket();
@@ -604,7 +607,8 @@ shared TicketCounter globalLock;
                         auto steal_amount = cast(int)(max_queue_length * (1f/3f));
                         // lock the victim queue;
                         const ticket = victim.queueLock.drawTicket();
-                        while(victim.queueLock.servingMe(ticket)) {}
+                        while(!victim.queueLock.servingMe(ticket)) {}
+
                         {
                             atomicFence();
                             scope(exit) victim.queueLock.releaseTicket(ticket);
