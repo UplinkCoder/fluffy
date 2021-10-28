@@ -623,8 +623,9 @@ shared uint workersReady = 0;
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
                 int longest_queue_idx = -1;
-
-/+
+        enum work_stealing = false;
+        static if (work_stealing)
+        {
                 printf("Queue empty ... let's steal some work\n");
 
                 {
@@ -657,7 +658,7 @@ shared uint workersReady = 0;
                         continue;
                     }
                 }
-+/
+        } // work_stealing
                 if (longest_queue_idx == -1)
                 {
                     mixin(zoneMixin("Out of work ... no victim ... sleeping"));
@@ -732,6 +733,7 @@ void wait_until_workers_are_ready()
     {
         if (atomicLoad!(MemoryOrder.raw)(workersReady) == n_workers)
             break;
+        micro_sleep(1);
     }
 }
 
@@ -821,7 +823,7 @@ void fluffy_main(string[] args)
     shared ulong sum;
     shared TicketCounter sumSync;
     auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-    enum task_multiplier = 128;
+    enum task_multiplier = 96;
 
     WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : task_multiplier };
 
