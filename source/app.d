@@ -715,16 +715,27 @@ shared uint workersReady = 0;
 }
 shared ulong completedTasks;
 shared uint n_workers = 0;
+
 version (MARS) {}
 else
 {
     void main(string[] args)
     {
-        return fluffy_main(args);
+        
+        int n_workers_;
+        if (args.length == 2 && args[1].length && args[1].length < 3)
+        {
+            if (args[1].length == 2)
+                n_workers_ += ((args[1][0] - '0') * 10);
+            n_workers_ += (args[1][$-1] - '0');
+        }
+        import std.parallelism : totalCPUs;
+
+        if (!n_workers_)
+            n_workers_ = totalCPUs - 1;
+        auto myqueues = fluffy_get_queues(n_workers_);        
     }
 }
-
-shared TaskQueue* g_queue;
 
 void wait_until_workers_are_ready()
 {
@@ -737,7 +748,9 @@ void wait_until_workers_are_ready()
     }
 }
 
-void fluffy_main(string[] args)
+shared TaskQueue* g_queue;
+
+shared(TaskQueue*[]) fluffy_get_queues(uint n_workers_)
 {
     mixin(zoneMixin("Main"));
 
@@ -751,33 +764,16 @@ void fluffy_main(string[] args)
         TaskQueue.initQueue(&g_queue, -1);
     }
     atomicFence();
+    (cast(uint)n_workers) = n_workers_;
 
-    import std.parallelism : totalCPUs;
     import core.stdc.stdlib;
     alloc = cast(shared) Alloc(ushort.max);
-
-    {
-        int n_workers_;
-        //    workers.length = totalCPUs - 1;
-        if (args.length == 2 && args[1].length && args[1].length < 3)
-        {
-            if (args[1].length == 2)
-                n_workers_ += ((args[1][0] - '0') * 10);
-            n_workers_ += (args[1][$-1] - '0');
-        }
-
-        if (!n_workers_)
-            n_workers_ = totalCPUs - 1;
-    
-
-        (cast(uint)n_workers) = n_workers_;
-    }
 
     printf("starting %d workers\n", n_workers);
     workers.length = n_workers;
 
     import core.stdc.stdio;
-
+    import std.parallelism : totalCPUs;
     printf("Found %d cores\n", totalCPUs);
 
     void* queuesMem = malloc(align16(((TaskQueue*).sizeof * workers.length)));
@@ -851,7 +847,7 @@ void fluffy_main(string[] args)
     while((lastSum = atomicLoad(sum)) != expected)
     {
         micro_sleep(310);
-        // printf("lastSum: %llu\n", lastSum);
+        printf("lastSum: %llu\n", lastSum);
     }
 
     foreach(ref w;workers)
@@ -864,4 +860,5 @@ void fluffy_main(string[] args)
 //    assert(sum == 10_000 * 12 * 1440);
 
     printf("completedTasks: %llu\n", atomicLoad!(MemoryOrder.raw)(completedTasks));
+    return cast(shared(TaskQueue*[])) queues;
 }

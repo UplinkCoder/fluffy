@@ -157,7 +157,7 @@ struct Task
 {
     task_function_t fn;
     shared (void*) taskData;
-
+    // shared (void*) taskResult;
     shared (TicketCounter)* syncLock;
 
     align(16) shared TicketCounter taskLock;
