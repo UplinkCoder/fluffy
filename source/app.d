@@ -146,7 +146,7 @@ align(16) struct TaskQueue {
     /// this function will deposit the stolen items directly
     /// into your queue
     /// we will lock it for this purpose
-    uint steal(uint stealAmount, shared(TaskQueue)* thiefQueue, Ticket ticket) shared
+    int steal(int stealAmount, shared(TaskQueue)* thiefQueue, Ticket ticket) shared
     {
         // we can assume the thief has locked the queue;
         // let's make sure though
@@ -154,47 +154,58 @@ align(16) struct TaskQueue {
         {
             printf("queueLock not held by theif? -- thiefTicket: %d -- currentlyServing: %d",
                 ticket.ticket, queueLock.currentlyServing);
+            assert(0);
         }
-        assert(queueLock.currentlyServing == ticket.ticket,
-            "Thief has not locked the queue");
-        Ticket thiefQueueTicket = thiefQueue.queueLock.drawTicket();
-        while (!thiefQueue.queueLock.servingMe(thiefQueueTicket)) {}
+
 
         import std.algorithm.comparison : min;
 
-        uint stolen_items;
-        atomicFence();
+        int stolen_items;
+        atomicFence!(MemoryOrder.seq)();
         {
-            scope(exit) queueLock.releaseTicket(thiefQueueTicket);
             // we are locked so raw reads are fine
             const victimReadP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
             const victimWriteP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
             stolen_items = min(stealAmount, tasksInQueue(victimReadP, victimWriteP));
-
+            breakpoint;
             if (victimReadP <= victimWriteP // writeP - readP = items ok
                 || victimWriteP >= stolen_items // ignore wraparound if we don't steal across the boundry
             )
             {
                 // easy case we can just substract to get the number of items
                 auto begin_pos = cast(int) (victimWriteP - stolen_items);
-                assert(thiefQueue.push(cast(Task*)&((queue)[begin_pos]), cast(int)(victimWriteP - begin_pos)));
-                // stealing renomalizes or pointers ... nice
-                atomicStore!(MemoryOrder.raw)(writePointer, begin_pos);
-
+                int pushed = thiefQueue.push(cast(Task*)&((queue)[begin_pos]), cast(int)(victimWriteP - begin_pos));
+                uint newWritePointer = cast(uint)(victimWriteP - pushed);
+                stolen_items = pushed;
+                // stealing renormalizes or pointers ... nice
+                atomicStore!(MemoryOrder.raw)(writePointer, newWritePointer);
             }
             else
             {
                 // not as easy we need to push in two steps
                 // first from writePointer to zero
                 int remaining = cast(int)(stolen_items - victimWriteP);
-                assert(thiefQueue.push(cast(Task*)&((queue)[0]), victimWriteP));
                 int newWritePointer = cast(int)(queue.length - remaining);
-                assert(thiefQueue.push(cast(Task*)&((queue)[newWritePointer]), remaining));
+                int pushed = thiefQueue.push(cast(Task*)&((queue)[0]), victimWriteP);
+                // we didn't lock the queue when we initiated the steal ... so maybe be could not actually push our stolen items
+                
+                if (stolen_items - pushed > remaining)
+                {
+                    // we couldn't push all of them
+                    // the number of stolen items if the number of what we could push
+                    newWritePointer = cast(uint)(victimWriteP - pushed);
+                    stolen_items = pushed;
+                }
+                else
+                {
+                    pushed = thiefQueue.push(cast(Task*)&((queue)[newWritePointer]), remaining);
+                    newWritePointer = cast(uint)(queue.length - pushed);
+                    stolen_items = (stolen_items - remaining + pushed);   
+                }
                 atomicStore!(MemoryOrder.raw)(writePointer, newWritePointer);
             }
             
         }
-        atomicFence();
 
         return stolen_items;
     }
@@ -287,18 +298,21 @@ align(16) struct TaskQueue {
             return false;
         }
 +/
+
         Ticket ticket;
         {
             ticket = queueLock.drawTicket();
         }
 
+
         {
-            mixin(zoneMixin("waiting"));
+            // mixin(zoneMixin("waiting"));
             while(!queueLock.servingMe(ticket)) {}
-            atomicFence!(MemoryOrder.seq)();
+            atomicFence!(MemoryOrder.seq);
         }
         // we've got the lock
         //printf("push Task\n");
+        // only release a ticket which you have aquired
         scope (exit) queueLock.releaseTicket(ticket);
         {
             const readP = atomicLoad(readPointer) & (queue.length - 1);
@@ -320,7 +334,6 @@ align(16) struct TaskQueue {
             atomicOp!"+="(writePointer, n);
             {
                 {
-                    mixin(zoneMixin("poking queue ids"));
                     foreach(tIdx; 0 .. n)
                     {
                         task[tIdx].queueID = queueID;
@@ -328,7 +341,6 @@ align(16) struct TaskQueue {
                 }
                 atomicFence!(MemoryOrder.seq);
                 {
-                    mixin(zoneMixin("issue write"));
                     // let's do the simple case first
                     if (writeP + n < queue.length)
                     {
@@ -350,7 +362,7 @@ align(16) struct TaskQueue {
             }
         }
 
-        return true;
+        return n;
     }
 
     bool pull(Task* task) shared
@@ -391,10 +403,10 @@ align(16) struct TaskQueue {
             {
                 return false;
             }
-            mixin(zoneMixin("Read"));
             // printf("pulled task from queue\n");
-            atomicFence!(MemoryOrder.seq)();
+
             *task = cast()(queue)[readP];
+            atomicFence!(MemoryOrder.seq)();
 
             atomicOp!"+="(readPointer, 1);
         }
@@ -623,13 +635,13 @@ shared uint workersReady = 0;
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
                 int longest_queue_idx = -1;
-        enum work_stealing = false;
+        enum work_stealing = true;
         static if (work_stealing)
         {
                 printf("Queue empty ... let's steal some work\n");
 
                 {
-                    uint max_queue_length = 0;
+                    uint max_queue_length = 30; // a vicitm needs to have at least 30 tasks to be considered a target
                     shared(TaskQueue)* victim;
                     foreach(qIdx; 0 .. queues.length)
                     {
@@ -647,13 +659,17 @@ shared uint workersReady = 0;
                         // lock the victim queue;
                         const ticket = victim.queueLock.drawTicket();
                         while(!victim.queueLock.servingMe(ticket)) {}
-
+                        
                         {
+                            printf("got the lock doing the steal\n");
                             mixin(zoneMixin("Stealing work"));
-                            atomicFence();
-                            scope(exit) victim.queueLock.releaseTicket(ticket);
+                            atomicFence!(MemoryOrder.seq)();
+                            
                             auto n_stolen = victim.steal(steal_amount, myQueue, ticket);
-                            atomicFence();
+                            printf("stolen %d tasks\n", n_stolen);
+                            atomicFence!(MemoryOrder.seq)();
+                            victim.queueLock.releaseTicket(ticket);
+
                         }
                         continue;
                     }
@@ -847,7 +863,7 @@ shared(TaskQueue*[]) fluffy_get_queues(uint n_workers_)
     while((lastSum = atomicLoad(sum)) != expected)
     {
         micro_sleep(310);
-        printf("lastSum: %llu\n", lastSum);
+        //printf("lastSum: %llu\n", lastSum);
     }
 
     foreach(ref w;workers)
