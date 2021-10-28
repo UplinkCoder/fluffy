@@ -162,8 +162,6 @@ struct Task
 
     align(16) shared TicketCounter taskLock;
 
-    bool isBackgroundTask;
-
     shared Task*[] children;
     shared size_t n_children_completed;
 

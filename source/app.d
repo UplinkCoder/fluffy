@@ -93,11 +93,11 @@ struct TaskInQueue
 
 extern (C) void breakpoint () {}
 
-bool addTask(Task* task, uint myQueue = uint.max)
+uint addTask(Task* task, uint myQueue = uint.max)
 {
     mixin(zoneMixin("addTask"));
 
-    shared static currentQueue = 0;
+    /*tls*/ static currentQueue = 0;
     uint pushIntoQueue = currentQueue;
 
     static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (5f/6f));
@@ -122,10 +122,12 @@ bool addTask(Task* task, uint myQueue = uint.max)
     }
     else
     {
-        if (pushIntoQueue >= queues.length)
+
+        if (++currentQueue >= queues.length)
         {
-            pushIntoQueue = 0;
+            currentQueue = 0;
         }
+
         return queues[pushIntoQueue].push(task);
     }
 }
@@ -136,7 +138,9 @@ align(16) struct TaskQueue {
     align(16) shared uint readPointer; // head
     align(16) shared uint writePointer; // tail
 
-    Task[1024]* queue;
+    Task[1024] queue;
+
+    short queueID;
 
     /// returns how many tasks have been stolen
     /// this function will deposit the stolen items directly
@@ -151,12 +155,13 @@ align(16) struct TaskQueue {
             printf("queueLock not held by theif? -- thiefTicket: %d -- currentlyServing: %d",
                 ticket.ticket, queueLock.currentlyServing);
         }
-        assert(queueLock.currentlyServing == ticket.ticket, 
+        assert(queueLock.currentlyServing == ticket.ticket,
             "Thief has not locked the queue");
         Ticket thiefQueueTicket = thiefQueue.queueLock.drawTicket();
-        while (thiefQueue.queueLock.servingMe(thiefQueueTicket)) {}
+        while (!thiefQueue.queueLock.servingMe(thiefQueueTicket)) {}
+
         import std.algorithm.comparison : min;
-     
+
         uint stolen_items;
         atomicFence();
         {
@@ -166,24 +171,25 @@ align(16) struct TaskQueue {
             const victimWriteP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
             stolen_items = min(stealAmount, tasksInQueue(victimReadP, victimWriteP));
 
-            if (victimReadP <= victimWriteP // writeP - readP = items ok 
+            if (victimReadP <= victimWriteP // writeP - readP = items ok
                 || victimWriteP >= stolen_items // ignore wraparound if we don't steal across the boundry
             )
             {
                 // easy case we can just substract to get the number of items
                 auto begin_pos = cast(int) (victimWriteP - stolen_items);
-                assert(thiefQueue.push(cast(Task*)&((*queue)[begin_pos]), cast(int)(victimWriteP - begin_pos)));
+                assert(thiefQueue.push(cast(Task*)&((queue)[begin_pos]), cast(int)(victimWriteP - begin_pos)));
                 // stealing renomalizes or pointers ... nice
                 atomicStore!(MemoryOrder.raw)(writePointer, begin_pos);
+
             }
             else
             {
                 // not as easy we need to push in two steps
                 // first from writePointer to zero
                 int remaining = cast(int)(stolen_items - victimWriteP);
-                assert(thiefQueue.push(cast(Task*)&((*queue)[0]), victimWriteP));
+                assert(thiefQueue.push(cast(Task*)&((queue)[0]), victimWriteP));
                 int newWritePointer = cast(int)(queue.length - remaining);
-                assert(thiefQueue.push(cast(Task*)&((*queue)[newWritePointer]), remaining));
+                assert(thiefQueue.push(cast(Task*)&((queue)[newWritePointer]), remaining));
                 atomicStore!(MemoryOrder.raw)(writePointer, newWritePointer);
             }
             
@@ -238,16 +244,18 @@ align(16) struct TaskQueue {
         return tasksInQueue(readP, writeP);
     }
 
-    void initQueue() shared
+    static void initQueue(shared(TaskQueue*)* q, short queueID)
     {
         import core.stdc.stdlib;
-        readPointer = writePointer = 0;
-        queueLock = TicketCounter.init;
-        void* taskMemPtr = malloc(align16((*queue).sizeof));
-        queue = cast(typeof(queue))align16(cast(size_t)taskMemPtr);
+        void* queueMem = malloc(align16(TaskQueue.sizeof + 16));
+        (*q) = (cast(shared(TaskQueue)*)align16(cast(size_t)queueMem));
+
+        (**q).readPointer = (**q).writePointer = 0;
+        (**q).queueLock = TicketCounter.init;
+        (**q).queueID = queueID;
     }
 
-    bool enqueueTermination(string terminationMessage) shared
+    uint enqueueTermination(string terminationMessage) shared
     {
         // little guard to we don't push the message if the chance of success is low
         if (tasksInQueue() > (queue.length - 4))
@@ -257,9 +265,10 @@ align(16) struct TaskQueue {
         return push(&terminationTask);
     }
 
-    bool push(Task* task, int n = 1) shared
+    uint push(Task* task, int n = 1) shared
     {
         mixin(zoneMixin("push"));
+        uint tasks_written = 0;
         // as an optimisation we check for an full queue first
         {
             const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
@@ -268,7 +277,7 @@ align(16) struct TaskQueue {
             // update readP and writeP
             if (readP == writeP + 1)
             {
-                return false;
+                return 0;
             }
         }
 
@@ -285,7 +294,6 @@ align(16) struct TaskQueue {
 
         {
             mixin(zoneMixin("waiting"));
-            atomicFence!(MemoryOrder.seq)();
             while(!queueLock.servingMe(ticket)) {}
             atomicFence!(MemoryOrder.seq)();
         }
@@ -298,24 +306,47 @@ align(16) struct TaskQueue {
             // update readP and writeP
             auto tasksFit = queue.length - tasksInQueue(readP, writeP);
 
-            if (n >= tasksFit)
+            if (n > tasksFit)
             {
-                return false;
+                return 0;
             }
 
             if (readP == writeP + 1)
             {
-                return false;
+                return 0;
+            }
+            // we know the tasks fit so there's no problem with us just updating
+            // the write pointer here we have the old value if writeP
+            atomicOp!"+="(writePointer, n);
+            {
+                {
+                    mixin(zoneMixin("poking queue ids"));
+                    foreach(tIdx; 0 .. n)
+                    {
+                        task[tIdx].queueID = queueID;
+                    }
+                }
+                atomicFence!(MemoryOrder.seq);
+                {
+                    mixin(zoneMixin("issue write"));
+                    // let's do the simple case first
+                    if (writeP + n < queue.length)
+                    {
+                        queue[writeP .. writeP + n] = task[0 .. n];
+                    }
+                    else
+                    {
+                        // now the tricker case
+                        int remaining = queue.length - writeP;
+                        queue[writeP .. $] = task[0 .. n - (remaining - 1)];
+                        queue[0 .. remaining] = task[n - remaining .. remaining];
+                    }
+                }
+                atomicFence!(MemoryOrder.seq);
             }
 
             {
-                mixin(zoneMixin("issue write"));
-                cast()(*queue)[writeP] = *task;
-                atomicFence!(MemoryOrder.seq)();
-            }
 
-            {
-                atomicOp!"+="(writePointer, 1);
             }
         }
 
@@ -363,7 +394,7 @@ align(16) struct TaskQueue {
             mixin(zoneMixin("Read"));
             // printf("pulled task from queue\n");
             atomicFence!(MemoryOrder.seq)();
-            *task = cast()(*queue)[readP];
+            *task = cast()(queue)[readP];
 
             atomicOp!"+="(readPointer, 1);
         }
@@ -394,7 +425,7 @@ unittest
     q.queueLock.releaseTicket(ticket3);
 }
 
-shared TaskQueue[] queues = void;
+shared TaskQueue*[] queues;
 
 
 struct Worker
@@ -423,7 +454,7 @@ struct WorkMarkerArgs
 
     foreach(_; 0 .. args.how_many)
     {
-        while(!addTask(args.work, task.queueID)) 
+        while(!addTask(args.work)) 
         {
             TracyMessage("work_maker_yield");
             task.currentFiber.yield();
@@ -492,6 +523,7 @@ shared uint expected_completions = uint.max;
         ___tracy_emit_plot("completedTasks", lastCompletedTasks);
         foreach(i; 0 .. workers.length)
         {
+            TaskQueue* q = cast(TaskQueue*)queues[i];
             ___tracy_emit_plot(worker_queue_strings[i].ptr, queues[i].tasksInQueue());
         }
 
@@ -513,7 +545,7 @@ shared uint expected_completions = uint.max;
             bool enqueuedTermination = false;
             while(!enqueuedTermination)
             {
-                enqueuedTermination = queues[i].enqueueTermination("Watcher termination");
+                enqueuedTermination = !!queues[i].enqueueTermination("Watcher termination");
             }
             printf("Termination scheduled\n");
         }
@@ -522,13 +554,13 @@ shared uint expected_completions = uint.max;
 }
 
 shared TicketCounter globalLock;
+shared uint workersReady = 0;
 
 @threadproc void workerFunction () {
-    breakpoint();
     mixin(zoneMixin("workerFunction"));
 
     static shared int workerCounter;
-    /*tls*/ int workerIndex = atomicOp!"+="(workerCounter, 1) - 1;
+    /*tls*/ short workerIndex = cast(short)(atomicOp!"+="(workerCounter, 1) - 1);
     /*tls*/ char[16] worker_name;
     sprintf(&worker_name[0], "Worker %d", workerIndex);
     printf("%s is starting\n", &worker_name[0]);
@@ -536,7 +568,9 @@ shared TicketCounter globalLock;
     ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
     /*tls*/ shared (bool) *terminate = &workers[workerIndex].terminate;
-    /*tls*/ shared(TaskQueue)* myQueue = &queues[workerIndex];
+    /*tls*/ shared(TaskQueue*)* myQueueP = &queues[workerIndex];
+    TaskQueue.initQueue(myQueueP, cast(short)(workerIndex + 1));
+    shared (TaskQueue)* myQueue = *myQueueP;
     /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
     /*tls*/ int[fiberPool.fibers.length] fiberExecCount;
     {
@@ -547,12 +581,14 @@ shared TicketCounter globalLock;
             atomicFence();
         }
         /*tls*/ fiberPool.initFiberPool();
+        atomicOp!"+="(workersReady, 1);
         {
             atomicFence();
             globalLock.releaseTicket(initTicket);
         }
     }
 
+    wait_until_workers_are_ready();
 
     /*tls*/ int myCounter = 0;
     /*tls*/ Task task;
@@ -586,20 +622,22 @@ shared TicketCounter globalLock;
                 // no fibers used
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
+                int longest_queue_idx = -1;
+
+/+
                 printf("Queue empty ... let's steal some work\n");
 
                 {
                     uint max_queue_length = 0;
-                    int longest_queue_idx = -1;
                     shared(TaskQueue)* victim;
                     foreach(qIdx; 0 .. queues.length)
                     {
-                        auto canidate = &queues[qIdx];
+                        auto canidate = queues[qIdx];
                         auto canidate_n_tasks = canidate.tasksInQueue();
                         if (canidate_n_tasks > max_queue_length)
                         {
                             victim = canidate;
-                            max_queue_length = canidate_n_tasks; 
+                            max_queue_length = canidate_n_tasks;
                         }
                     }
                     if (victim)
@@ -610,6 +648,7 @@ shared TicketCounter globalLock;
                         while(!victim.queueLock.servingMe(ticket)) {}
 
                         {
+                            mixin(zoneMixin("Stealing work"));
                             atomicFence();
                             scope(exit) victim.queueLock.releaseTicket(ticket);
                             auto n_stolen = victim.steal(steal_amount, myQueue, ticket);
@@ -617,16 +656,17 @@ shared TicketCounter globalLock;
                         }
                         continue;
                     }
-
-
-                    if (longest_queue_idx == -1)
-                    {
-                        // there's no-one to seal from
-                        // let's sleep and continue later
-                        micro_sleep(2);
-                        continue;
-                    }
                 }
++/
+                if (longest_queue_idx == -1)
+                {
+                    mixin(zoneMixin("Out of work ... no victim ... sleeping"));
+                    // there's no-one to steal from
+                    // let's sleep and continue later
+                    micro_sleep(2);
+                    continue;
+                }
+
             }
         }
 
@@ -673,13 +713,25 @@ shared TicketCounter globalLock;
     TracyMessage("Goobye!");
 }
 shared ulong completedTasks;
-
+shared uint n_workers = 0;
 version (MARS) {}
 else
 {
     void main(string[] args)
     {
         return fluffy_main(args);
+    }
+}
+
+shared TaskQueue* g_queue;
+
+void wait_until_workers_are_ready()
+{
+    assert(atomicLoad(n_workers) != 0);
+    for(;;)
+    {
+        if (atomicLoad!(MemoryOrder.raw)(workersReady) == n_workers)
+            break;
     }
 }
 
@@ -690,41 +742,46 @@ void fluffy_main(string[] args)
     import core.memory;
     GC.disable();
 
+    import core.stdc.stdlib;
+    {
+        void* queueMemory = malloc(align16(TaskQueue.sizeof));
+        g_queue = cast(shared TaskQueue*) align16(cast(size_t)queueMemory);
+        TaskQueue.initQueue(&g_queue, -1);
+    }
+    atomicFence();
+
     import std.parallelism : totalCPUs;
     import core.stdc.stdlib;
     alloc = cast(shared) Alloc(ushort.max);
 
-    int n_workers;
-//    workers.length = totalCPUs - 1;
-    if (args.length == 2 && args[1].length && args[1].length < 3)
     {
-        n_workers = 0;
-        if (args[1].length == 2)
-            n_workers += ((args[1][0] - '0') * 10);
-        n_workers += (args[1][$-1] - '0');
-    }
+        int n_workers_;
+        //    workers.length = totalCPUs - 1;
+        if (args.length == 2 && args[1].length && args[1].length < 3)
+        {
+            if (args[1].length == 2)
+                n_workers_ += ((args[1][0] - '0') * 10);
+            n_workers_ += (args[1][$-1] - '0');
+        }
 
-    if (!n_workers)
-        n_workers = totalCPUs - 1;
+        if (!n_workers_)
+            n_workers_ = totalCPUs - 1;
+    
+
+        (cast(uint)n_workers) = n_workers_;
+    }
 
     printf("starting %d workers\n", n_workers);
     workers.length = n_workers;
-
-    void* queueMemory = malloc(align16(TaskQueue.sizeof * workers.length));
-    shared(TaskQueue)* alignedMem = cast(shared TaskQueue*) align16(cast(size_t)queueMemory);
-    pragma(msg, TaskQueue.sizeof);
-    queues = alignedMem[0 .. workers.length];
 
     import core.stdc.stdio;
 
     printf("Found %d cores\n", totalCPUs);
 
-    {
-        foreach(i; 0 .. workers.length)
-        {
-            queues[i].initQueue();
-        }
-    }
+    void* queuesMem = malloc(align16(((TaskQueue*).sizeof * workers.length)));
+    queues = (cast(shared(TaskQueue*)*)align16(cast(size_t)queuesMem))[0 .. workers.length];
+
+    atomicFence();
 
     {
         mixin(zoneMixin("Thread creation"));
@@ -734,18 +791,11 @@ void fluffy_main(string[] args)
         }
     }
 
-    printf("All workers are initialized\n");
+    printf("All worker threads are created\n");
 
     string fName = "a";
     string[] result;
-    // addTask(Task(&loadFiles, cast(shared void*)&fName, false));
-    // printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
-    // Thread.sleep(msecs(100));
 
-    // task should now be in queue zero
-    // printf("tasksInQueue zero: %d\n", queues[0].tasksInQueue());
-
-    // all need be initted before we start them
     {
         mixin(zoneMixin("threadStartup"));
         foreach(i; 0 .. workers.length)
@@ -754,6 +804,10 @@ void fluffy_main(string[] args)
         }
     }
 
+    // we need to wait until all the threads had a chance to init their queues
+    wait_until_workers_are_ready();
+
+    printf ("workers are ready it seems\n");
     // fire up the watcher which terminates the threads
     // before we push tasks since it also reports stats
     auto watcher = new Thread(&watcherFunction, 128);
