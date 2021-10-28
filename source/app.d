@@ -461,7 +461,7 @@ struct WorkMarkerArgs
             TracyMessage("work_maker_continue");
         }
     }
-    printf("WorkMaker done\n");
+    // printf("WorkMaker done\n");
 }
 
 @Task void countTaskFn(Task* task)
@@ -845,18 +845,17 @@ void fluffy_main(string[] args)
     printf("expected: %llu\n", expected);
 
     ulong lastSum;
+
     while((lastSum = atomicLoad(sum)) != expected)
     {
         micro_sleep(310);
-        printf("lastSum: %llu\n", lastSum);
+        // printf("lastSum: %llu\n", lastSum);
     }
-/+
+
     foreach(ref w;workers)
     {
         (cast()w.workerThread).join();
     }
-+/
-
 
     printf("sum: %llu\n", sum);
 
