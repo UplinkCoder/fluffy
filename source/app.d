@@ -154,13 +154,15 @@ align(16) struct TaskQueue {
         while (thiefQueue.queueLock.servingMe(thiefQueueTicket)) {}
         import std.algorithm.comparison : min;
      
-        uint stolen_items = min(stealAmount, tasksInQueue());
+        uint stolen_items;
         atomicFence();
         {
             scope(exit) queueLock.releaseTicket(thiefQueueTicket);
             // we are locked so raw reads are fine
             const victimReadP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
             const victimWriteP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
+            stolen_items = min(stealAmount, tasksInQueue(victimReadP, victimWriteP));
+
             if (victimReadP <= victimWriteP // writeP - readP = items ok 
                 || victimWriteP >= stolen_items // ignore wraparound if we don't steal across the boundry
             )
@@ -200,6 +202,21 @@ align(16) struct TaskQueue {
         return queueLock.nextTicket != queueLock.currentlyServing;
     }
 
+    static int tasksInQueue(uint readP, uint writeP)
+    {
+        pragma(inline, true);
+        if (writeP >= readP)
+        {
+            return cast(int)(writeP - readP);
+        }
+        else
+        {
+            // wrap-around
+            // we go from readP to length and from zero to writeP
+            return cast(int)((TaskQueue.init.queue.length - readP) + writeP); 
+        }
+    }
+
     int tasksInQueue(bool consistent = false) shared
     {
         Ticket ticket;
@@ -215,16 +232,7 @@ align(16) struct TaskQueue {
         }
         const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
         const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
-        if (writeP >= readP)
-        {
-            return cast(int)(writeP - readP);
-        }
-        else
-        {
-            // wrap-around
-            // we go from readP to length and from zero to writeP
-            return cast(int)((queue.length - readP) + writeP); 
-        }
+        return tasksInQueue(readP, writeP);
     }
 
     void initQueue() shared
@@ -285,11 +293,8 @@ align(16) struct TaskQueue {
             const readP = atomicLoad(readPointer) & (queue.length - 1);
             const writeP = atomicLoad(writePointer) & (queue.length - 1);
             // update readP and writeP
-            auto tasksFit = queue.length - (cast(int)(writeP - readP));
-            if (n > queue.length / 2)
-            {
-                assert(0, "this many tasks can never fit");
-            }
+            auto tasksFit = queue.length - tasksInQueue(readP, writeP);
+
             if (n >= tasksFit)
             {
                 return false;
@@ -350,7 +355,6 @@ align(16) struct TaskQueue {
             // update readP and writeP
             if (readP == writeP)
             {
-              //  assert(tasksInQueue() == 0);
                 return false;
             }
             mixin(zoneMixin("Read"));
