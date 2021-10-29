@@ -72,7 +72,11 @@ struct FiberPool
 @("tracy"):
     TaskFiber[freeBitfield.sizeof * 8] fibers = null;
     void* fiberPoolStorage = null;
-    
+
+    uint scheduled;
+    uint completed;
+    uint inUse;
+
     uint freeBitfield = (~0);
     
     static immutable INVALID_FIBER_IDX = 0;
@@ -135,6 +139,8 @@ struct FiberPool
     void free(TaskFiber fiber)
     {
         assert(!fiber.hasTask);
+        completed++;
+        inUse--;
         const fiberIdx = fiber.idx;
         assert(fiberIdx < fibers.length);
         freeBitfield |= (1 << fiberIdx);
@@ -145,6 +151,8 @@ struct FiberPool
         if (const fiberIdx = nextFree())
         {
             assert(fiberIdx != INVALID_FIBER_IDX);
+            scheduled++;
+            inUse++;
             freeBitfield &= ~(1 << (fiberIdx - 1));
             return fibers[fiberIdx - 1];
         }
@@ -159,6 +167,15 @@ struct Task
     shared (void*) taskData;
     // shared (void*) taskResult;
     shared (TicketCounter)* syncLock;
+
+    this(task_function_t myFn, shared void *myTaskData = null, shared (TicketCounter*) myLock = null)
+    {
+        import core.atomic;
+        this.fn = myFn;
+        this.taskData = myTaskData;
+        this.syncLock = myLock;
+        this.taskId = atomicOp!"+="(runningId, 1);
+    }
 
     align(16) shared TicketCounter taskLock;
 
@@ -184,7 +201,10 @@ struct Task
     //{
         OriginInformation originInfo;
     //}
-
+    uint taskId;
+    uint schedulerId;
+    shared static uint runningId;
+    shared static uint runningSchedulerId;
 }
 
 size_t align16(const size_t n) pure

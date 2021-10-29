@@ -337,28 +337,29 @@ align(16) struct TaskQueue {
                     foreach(tIdx; 0 .. n)
                     {
                         task[tIdx].queueID = queueID;
+                        task[tIdx].schedulerId = atomicOp!"+="(task.runningSchedulerId, 1);
                     }
                 }
                 atomicFence!(MemoryOrder.seq);
                 {
                     // let's do the simple case first
-                    if (writeP + n < queue.length)
+                    if (writeP + n <= queue.length)
                     {
                         queue[writeP .. writeP + n] = task[0 .. n];
                     }
                     else
                     {
-                        // now the tricker case
-                        int remaining = queue.length - writeP;
-                        queue[writeP .. $] = task[0 .. n - (remaining - 1)];
-                        queue[0 .. remaining] = task[n - remaining .. remaining];
+                        int overhang = cast(int)((writeP + n) - queue.length);
+                        // this is how much we cannot fit
+                        // therefore n - overhang is how much we can fit at the end
+                        int first_part = n - overhang;
+
+
+                        queue[writeP .. $] = task[0 .. first_part];
+                        queue[0 .. n - first_part] = task[first_part .. n];
                     }
                 }
                 atomicFence!(MemoryOrder.seq);
-            }
-
-            {
-
             }
         }
 
