@@ -1,5 +1,7 @@
 module fluffy.taskfiber;
 
+import fluffy.taskgroup;
+
 import core.stdc.stdio;
 
 import core.atomic;
@@ -201,6 +203,9 @@ struct Task
     //{
         OriginInformation originInfo;
     //}
+
+    TaskGroup* taskgroup;
+
     uint taskId;
     uint schedulerId;
     shared static uint runningId;

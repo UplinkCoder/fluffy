@@ -205,7 +205,7 @@ align(16) struct TaskQueue {
                     // let's do the simple case first
                     if (writeP + n <= queue.length)
                     {
-                        queue[writeP .. writeP + n] = task[0 .. n];
+                        (cast(Task[])queue[writeP .. writeP + n]) = task[0 .. n];
                     }
                     else
                     {
@@ -215,8 +215,8 @@ align(16) struct TaskQueue {
                         int first_part = n - overhang;
 
 
-                        queue[writeP .. $] = task[0 .. first_part];
-                        queue[0 .. n - first_part] = task[first_part .. n];
+                        (cast(Task[])queue[writeP .. $]) = task[0 .. first_part];
+                        (cast(Task[])queue[0 .. n - first_part]) = task[first_part .. n];
                     }
                 }
                 atomicFence!(MemoryOrder.seq);

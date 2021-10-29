@@ -298,11 +298,11 @@ private shared uint workersReady = 0;
                         // lock the victim queue;
                         const ticket = victim.queueLock.drawTicket();
                         while(!victim.queueLock.servingMe(ticket)) {}
-                        
+
                         {
                             mixin(zoneMixin("Stealing work"));
                             atomicFence!(MemoryOrder.seq)();
-                            
+
                             auto n_stolen = victim.steal(steal_amount, myQueue, ticket);
                             atomicFence!(MemoryOrder.seq)();
                             victim.queueLock.releaseTicket(ticket);
@@ -468,7 +468,7 @@ else
     void main(string[] args)
     {
         import core.stdc.stdio;
-    
+
         int n_workers_;
         if (args.length == 2 && args[1].length && args[1].length < 3)
         {
@@ -523,7 +523,7 @@ else
             (cast()w.workerThread).join();
         }
 
-        printf("sum: %llu\n", sum);        
+        printf("sum: %llu\n", sum);
     }
 }
 
