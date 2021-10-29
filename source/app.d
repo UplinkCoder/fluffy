@@ -1,6 +1,7 @@
 import core.memory : GC;
 import fluffy.taskfiber;
 import fluffy.ticket;
+import fluffy.taskqueue;
 import core.thread;
 import core.atomic;
 import core.stdc.stdio;
@@ -85,357 +86,7 @@ string* pushString(string s)
     return result;
 }
 
-struct TaskInQueue
-{
-    Task* taskP;
-    uint queueIndex;
-}
-
 extern (C) void breakpoint () {}
-
-uint addTask(Task* task, uint myQueue = uint.max)
-{
-    mixin(zoneMixin("addTask"));
-
-    /*tls*/ static currentQueue = 0;
-    uint pushIntoQueue = currentQueue;
-
-    static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (5f/6f));
-    if (myQueue != uint.max && queues[myQueue].tasksInQueue() < queueCutOff)
-    {
-        pushIntoQueue = myQueue;
-    }
-
-    version (multi_try)
-    {
-        auto maxAttempts = queues.length;
-
-        bool succeses = false;
-        while(maxAttempts-- && !succeses)
-        {
-            succeses = queues[currentQueue].push(task);
-            if (++currentQueue >= queues.length)
-                currentQueue = 0;
-        }
-
-        return succeses;
-    }
-    else
-    {
-
-        if (++currentQueue >= queues.length)
-        {
-            currentQueue = 0;
-        }
-
-        return queues[pushIntoQueue].push(task);
-    }
-}
-
-align(16) struct TaskQueue {
-    align (16) shared TicketCounter queueLock;
-
-    align(16) shared uint readPointer; // head
-    align(16) shared uint writePointer; // tail
-
-    Task[1024] queue;
-
-    short queueID;
-
-    /// returns how many tasks have been stolen
-    /// this function will deposit the stolen items directly
-    /// into your queue
-    /// we will lock it for this purpose
-    int steal(int stealAmount, shared(TaskQueue)* thiefQueue, Ticket ticket) shared
-    {
-        // we can assume the thief has locked the queue;
-        // let's make sure though
-        if (queueLock.currentlyServing != ticket.ticket)
-        {
-            printf("queueLock not held by theif? -- thiefTicket: %d -- currentlyServing: %d",
-                ticket.ticket, queueLock.currentlyServing);
-            assert(0);
-        }
-
-
-        import std.algorithm.comparison : min;
-
-        int stolen_items;
-        atomicFence!(MemoryOrder.seq)();
-        {
-            // we are locked so raw reads are fine
-            const victimReadP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
-            const victimWriteP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
-            stolen_items = min(stealAmount, tasksInQueue(victimReadP, victimWriteP));
-            breakpoint;
-            if (victimReadP <= victimWriteP // writeP - readP = items ok
-                || victimWriteP >= stolen_items // ignore wraparound if we don't steal across the boundry
-            )
-            {
-                // easy case we can just substract to get the number of items
-                auto begin_pos = cast(int) (victimWriteP - stolen_items);
-                int pushed = thiefQueue.push(cast(Task*)&((queue)[begin_pos]), cast(int)(victimWriteP - begin_pos));
-                uint newWritePointer = cast(uint)(victimWriteP - pushed);
-                stolen_items = pushed;
-                // stealing renormalizes or pointers ... nice
-                atomicStore!(MemoryOrder.raw)(writePointer, newWritePointer);
-            }
-            else
-            {
-                // not as easy we need to push in two steps
-                // first from writePointer to zero
-                int remaining = cast(int)(stolen_items - victimWriteP);
-                int newWritePointer = cast(int)(queue.length - remaining);
-                int pushed = thiefQueue.push(cast(Task*)&((queue)[0]), victimWriteP);
-                // we didn't lock the queue when we initiated the steal ... so maybe be could not actually push our stolen items
-                
-                if (stolen_items - pushed > remaining)
-                {
-                    // we couldn't push all of them
-                    // the number of stolen items if the number of what we could push
-                    newWritePointer = cast(uint)(victimWriteP - pushed);
-                    stolen_items = pushed;
-                }
-                else
-                {
-                    pushed = thiefQueue.push(cast(Task*)&((queue)[newWritePointer]), remaining);
-                    newWritePointer = cast(uint)(queue.length - pushed);
-                    stolen_items = (stolen_items - remaining + pushed);   
-                }
-                atomicStore!(MemoryOrder.raw)(writePointer, newWritePointer);
-            }
-            
-        }
-
-        return stolen_items;
-    }
-
-    unittest
-    {
-        TaskQueue victim;
-        // victim.push()
-        TaskQueue thief;
-    }
-
-    bool isLocked()
-    {
-        return queueLock.nextTicket != queueLock.currentlyServing;
-    }
-
-    static int tasksInQueue(uint readP, uint writeP)
-    {
-        pragma(inline, true);
-        if (writeP >= readP)
-        {
-            return cast(int)(writeP - readP);
-        }
-        else
-        {
-            // wrap-around
-            // we go from readP to length and from zero to writeP
-            return cast(int)((TaskQueue.init.queue.length - readP) + writeP); 
-        }
-    }
-
-    int tasksInQueue(bool consistent = false) shared
-    {
-        Ticket ticket;
-        if (consistent)
-        {
-            ticket = queueLock.drawTicket();
-            while (!queueLock.servingMe(ticket)) {}
-            atomicFence();
-        }
-        scope(exit)
-        {
-            if (consistent) queueLock.releaseTicket(ticket);
-        }
-        const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
-        const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
-        return tasksInQueue(readP, writeP);
-    }
-
-    static void initQueue(shared(TaskQueue*)* q, short queueID)
-    {
-        import core.stdc.stdlib;
-        void* queueMem = malloc(align16(TaskQueue.sizeof + 16));
-        (*q) = (cast(shared(TaskQueue)*)align16(cast(size_t)queueMem));
-
-        (**q).readPointer = (**q).writePointer = 0;
-        (**q).queueLock = TicketCounter.init;
-        (**q).queueID = queueID;
-    }
-
-    uint enqueueTermination(string terminationMessage) shared
-    {
-        // little guard to we don't push the message if the chance of success is low
-        if (tasksInQueue() > (queue.length - 4))
-            return false;
-
-        auto terminationTask = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
-        return push(&terminationTask);
-    }
-
-    uint push(Task* task, int n = 1) shared
-    {
-        mixin(zoneMixin("push"));
-        uint tasks_written = 0;
-        // as an optimisation we check for an full queue first
-        {
-            const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
-            const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
-            // printf("before pull -- readP: %d, writeP: %d\n", readP, writeP);
-            // update readP and writeP
-            if (readP == writeP + 1)
-            {
-                return 0;
-            }
-        }
-
-/+
-        if (queueLock.apporxQueueLength > 7)
-        {
-            return false;
-        }
-+/
-
-        Ticket ticket;
-        {
-            ticket = queueLock.drawTicket();
-        }
-
-
-        {
-            // mixin(zoneMixin("waiting"));
-            while(!queueLock.servingMe(ticket)) {}
-            atomicFence!(MemoryOrder.seq);
-        }
-        // we've got the lock
-        //printf("push Task\n");
-        // only release a ticket which you have aquired
-        scope (exit) queueLock.releaseTicket(ticket);
-        {
-            const readP = atomicLoad(readPointer) & (queue.length - 1);
-            const writeP = atomicLoad(writePointer) & (queue.length - 1);
-            // update readP and writeP
-
-            if (readP == writeP + 1 || // queue is full
-                tasksInQueue(readP, writeP) + n >= queue.length)
-            {
-                // tests don't fit.
-                return 0;
-            }
-
-            // we know the tasks fit so there's no problem with us just updating
-            // the write pointer here we have the old value if writeP
-            atomicOp!"+="(writePointer, n);
-            {
-                {
-                    foreach(tIdx; 0 .. n)
-                    {
-                        task[tIdx].queueID = queueID;
-                        task[tIdx].schedulerId = atomicOp!"+="(task.runningSchedulerId, 1);
-                    }
-                }
-                atomicFence!(MemoryOrder.seq);
-                {
-                    // let's do the simple case first
-                    if (writeP + n <= queue.length)
-                    {
-                        queue[writeP .. writeP + n] = task[0 .. n];
-                    }
-                    else
-                    {
-                        int overhang = cast(int)((writeP + n) - queue.length);
-                        // this is how much we cannot fit
-                        // therefore n - overhang is how much we can fit at the end
-                        int first_part = n - overhang;
-
-
-                        queue[writeP .. $] = task[0 .. first_part];
-                        queue[0 .. n - first_part] = task[first_part .. n];
-                    }
-                }
-                atomicFence!(MemoryOrder.seq);
-            }
-        }
-
-        return n;
-    }
-
-    bool pull(Task* task) shared
-    {
-        mixin(zoneMixin("Pull"));
-        // printf("try pulling\n");
-        // as an optimisation we check for an empty queue first
-        {
-            const readP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
-            const writeP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
-            // printf("before pull -- readP: %d, writeP: %d\n", readP, writeP);
-            // update readP and writeP
-            if (readP == writeP)
-            {
-                return false;
-            }
-        }
-        // the optimisation is totally worth it
-
-        Ticket ticket;
-        {
-            //mixin(zoneMixin("drawing ticket"));
-            ticket = queueLock.drawTicket();
-        }
-        {
-            //mixin(zoneMixin("wating on mutex"));
-            while(!queueLock.servingMe(ticket)) {}
-            atomicFence!();
-        }
-
-        {
-            scope (exit) queueLock.releaseTicket(ticket);
-            const readP = atomicLoad(readPointer) & (queue.length - 1);
-            const writeP = atomicLoad(writePointer) & (queue.length - 1);
-            // printf("before pull -- readP: %d, writeP: %d\n", readP, writeP);
-            // update readP and writeP
-            if (readP == writeP)
-            {
-                return false;
-            }
-            // printf("pulled task from queue\n");
-
-            *task = cast()(queue)[readP];
-            atomicFence!(MemoryOrder.seq)();
-
-            atomicOp!"+="(readPointer, 1);
-        }
-        return true;
-    }
-}
-
-unittest
-{
-    import core.stdc.stdio;
-    auto t1 = Task();
-    auto t2 = Task();
-    auto q = TaskQueue();
-    assert(q.tasksInQueue() == 0);
-    auto ticket1 = q.queueLock.drawTicket();
-    q.push(&t1, ticket1);
-    q.queueLock.releaseTicket(ticket1);
-    assert(q.tasksInQueue == 1);
-    auto ticket2 = q.queueLock.drawTicket();
-
-    q.push(&t2, ticket2);
-    assert(q.tasksInQueue() == 2);
-    q.queueLock.releaseTicket(ticket2);
-
-    auto ticket3 = q.queueLock.drawTicket();
-    q.pull(&t1, ticket3);
-    assert(q.tasksInQueue() == 1);
-    q.queueLock.releaseTicket(ticket3);
-}
-
-shared TaskQueue*[] queues;
 
 
 struct Worker
@@ -445,68 +96,12 @@ struct Worker
     FiberPool workerFiberPool;
 }
 
-shared Worker[] workers;
 extern (C) void ___tracy_set_thread_name( const char* name );
 
 enum threadproc;
 
-struct WorkMarkerArgs
-{
-    Task* work;
-    uint how_many;
-}
-
-@Task void workMakerFn(Task* task)
-{
-    TracyMessage("workMakerFn");
-
-    auto args = cast(WorkMarkerArgs*) task.taskData;
-
-    foreach(_; 0 .. args.how_many)
-    {
-        while(!addTask(args.work)) 
-        {
-            TracyMessage("work_maker_yield");
-            task.currentFiber.yield();
-            TracyMessage("work_maker_continue");
-        }
-    }
-    // printf("WorkMaker done\n");
-}
-
-@Task void countTaskFn(Task* task)
-{
-    with (task)
-    {
-        int x = 0;
-        while(++x != 10_000) {}
-
-
-        if (!syncLock)
-        {
-            assert(0, "The countTask needs a syncLock! since it has shared result");
-        }
-        const syncResultTicket = syncLock.drawTicket();
-
-        {
-            mixin(zoneMixin("waiting on result sync"));
-            while(!syncLock.servingMe(syncResultTicket)) {}
-            atomicFence();
-        }
-
-        {
-            // not shared because we aquired the lock
-            auto sumP = cast(ulong*) task.taskData;
-            (*sumP) += x;
-        }
-
-        {
-            atomicFence();
-            syncLock.releaseTicket(syncResultTicket);
-        }
-    }
-}
 shared bool killTheWatcher = false;
+shared bool killTheWorkers = false;
 shared uint expected_completions = uint.max;
 @threadproc void watcherFunction ()
 {
@@ -545,7 +140,7 @@ shared uint expected_completions = uint.max;
     micro_sleep(5);
 
     {
-        printf("lastCompletedTasks -- %llu -- expected_completions %llu", 
+        printf("lastCompletedTasks -- %llu -- expected_completions %u",
             lastCompletedTasks, atomicLoad!(MemoryOrder.raw)(expected_completions));
         printf("watcher: enquing termination\n");
         mixin(zoneMixin("watcher: enqueueingTermnination"));
@@ -563,8 +158,8 @@ shared uint expected_completions = uint.max;
     TracyMessage("Watcher says bye!");
 }
 
-shared TicketCounter globalLock;
-shared uint workersReady = 0;
+private shared TicketCounter globalLock;
+private shared uint workersReady = 0;
 
 @threadproc void workerFunction () {
     mixin(zoneMixin("workerFunction"));
@@ -604,7 +199,7 @@ shared uint workersReady = 0;
     /*tls*/ Task task;
 
     /*tls*/ static uint nextExecIdx;
-    for(;;)
+    while(!killTheWorkers)
     {
         // mixin(zoneMixin("WorkerLoop"));
         TaskFiber execFiber;
@@ -722,6 +317,8 @@ shared uint workersReady = 0;
 }
 shared ulong completedTasks;
 shared uint n_workers = 0;
+shared TaskQueue*[] queues;
+shared Worker[] workers;
 
 version (MARS) {}
 else
@@ -755,9 +352,19 @@ void wait_until_workers_are_ready()
     }
 }
 
+struct WorkersQueuesAndWatcher
+{
+    shared bool* killTheWatcher;
+    shared bool* killTheWorkers;
+    shared Thread watcher;
+    shared Worker[] workers;
+    shared TaskQueue*[] queues;
+
+}
+
 shared TaskQueue* g_queue;
 
-shared(TaskQueue*[]) fluffy_get_queues(uint n_workers_)
+WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
 {
     mixin(zoneMixin("Main"));
 
@@ -798,9 +405,6 @@ shared(TaskQueue*[]) fluffy_get_queues(uint n_workers_)
 
     printf("All worker threads are created\n");
 
-    string fName = "a";
-    string[] result;
-
     {
         mixin(zoneMixin("threadStartup"));
         foreach(i; 0 .. workers.length)
@@ -816,56 +420,15 @@ shared(TaskQueue*[]) fluffy_get_queues(uint n_workers_)
     // fire up the watcher which terminates the threads
     // before we push tasks since it also reports stats
     auto watcher = new Thread(&watcherFunction, 128);
-    watcher.start();
-    scope (exit)
+
+    WorkersQueuesAndWatcher result =
     {
-        watcher.join();
-    }
+        workers : workers,
+        queues : queues,
+        watcher : watcher,
+        killTheWatcher = &killTheWatcher,
+        killTheWorkers : &killTheWorkers
+    };
 
-
-    shared ulong sum;
-    shared TicketCounter sumSync;
-    auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-    enum task_multiplier = 96;
-
-    WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : task_multiplier };
-
-    // now we can push the work!
-    auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
-    printf("sum before addnig tasks: %llu\n", sum);
-    enum main_task_issues = 32;
-    atomicStore(expected_completions, (task_multiplier * main_task_issues) + main_task_issues);
-
-    foreach(_;0 .. main_task_issues)
-    {
-        // we need to loop on addTask because we might haven't got the chacne to schdule it
-        while(!addTask(&workMaker))
-        {
-            mixin(zoneMixin("waiting for queue to empty"));
-            micro_sleep(1);
-        }
-    }
-    micro_sleep(70);
-    const expected = cast(ulong) (10_000 * main_task_issues * task_multiplier);
-    printf("expected: %llu\n", expected);
-
-    ulong lastSum;
-
-    while((lastSum = atomicLoad(sum)) != expected)
-    {
-        micro_sleep(310);
-        //printf("lastSum: %llu\n", lastSum);
-    }
-
-    foreach(ref w;workers)
-    {
-        (cast()w.workerThread).join();
-    }
-
-    printf("sum: %llu\n", sum);
-
-//    assert(sum == 10_000 * 12 * 1440);
-
-    printf("completedTasks: %llu\n", atomicLoad!(MemoryOrder.raw)(completedTasks));
-    return cast(shared(TaskQueue*[])) queues;
+    return result;
 }
