@@ -21,7 +21,7 @@ align(16) struct TaskQueue {
     align(16) shared uint readPointer; // head
     align(16) shared uint writePointer; // tail
 
-    Task[1024] queue;
+    Task*[1024] queue;
 
     short queueID;
 
@@ -54,7 +54,7 @@ align(16) struct TaskQueue {
             {
                 // easy case we can just substract to get the number of items
                 auto begin_pos = cast(int) (victimWriteP - stolen_items);
-                int pushed = thiefQueue.push(cast(Task*)&((queue)[begin_pos]), cast(int)(victimWriteP - begin_pos));
+                int pushed = thiefQueue.push(cast(Task**)&((queue)[begin_pos]), cast(int)(victimWriteP - begin_pos));
                 uint newWritePointer = cast(uint)(victimWriteP - pushed);
                 stolen_items = pushed;
                 // stealing renormalizes or pointers ... nice
@@ -66,7 +66,7 @@ align(16) struct TaskQueue {
                 // first from writePointer to zero
                 int remaining = cast(int)(stolen_items - victimWriteP);
                 int newWritePointer = cast(int)(queue.length - remaining);
-                int pushed = thiefQueue.push(cast(Task*)&((queue)[0]), victimWriteP);
+                int pushed = thiefQueue.push(cast(Task**)&((queue)[0]), victimWriteP);
                 // we didn't lock the queue when we initiated the steal ... so maybe be could not actually push our stolen items
 
                 if (stolen_items - pushed > remaining)
@@ -78,7 +78,7 @@ align(16) struct TaskQueue {
                 }
                 else
                 {
-                    pushed = thiefQueue.push(cast(Task*)&((queue)[newWritePointer]), remaining);
+                    pushed = thiefQueue.push(cast(Task**)&((queue)[newWritePointer]), remaining);
                     newWritePointer = cast(uint)(queue.length - pushed);
                     stolen_items = (stolen_items - remaining + pushed);
                 }
@@ -139,7 +139,7 @@ align(16) struct TaskQueue {
         (**q).queueID = queueID;
     }
 
-    uint push(Task* task, int n = 1) shared
+    uint push(Task** task, int n = 1) shared
     {
         mixin(zoneMixin("push"));
         uint tasks_written = 0;
@@ -196,8 +196,8 @@ align(16) struct TaskQueue {
                 {
                     foreach(tIdx; 0 .. n)
                     {
-                        task[tIdx].queueID = queueID;
-                        task[tIdx].schedulerId = atomicOp!"+="(task.runningSchedulerId, 1);
+                        (*task)[tIdx].queueID = queueID;
+                        (*task)[tIdx].schedulerId = atomicOp!"+="((*task).runningSchedulerId, 1);
                     }
                 }
                 atomicFence!(MemoryOrder.seq);
@@ -205,7 +205,7 @@ align(16) struct TaskQueue {
                     // let's do the simple case first
                     if (writeP + n <= queue.length)
                     {
-                        (cast(Task[])queue[writeP .. writeP + n]) = task[0 .. n];
+                        (cast(Task*[])queue[writeP .. writeP + n]) = task[0 .. n];
                     }
                     else
                     {
@@ -215,8 +215,8 @@ align(16) struct TaskQueue {
                         int first_part = n - overhang;
 
 
-                        (cast(Task[])queue[writeP .. $]) = task[0 .. first_part];
-                        (cast(Task[])queue[0 .. n - first_part]) = task[first_part .. n];
+                        (cast(Task*[])queue[writeP .. $]) = task[0 .. first_part];
+                        (cast(Task*[])queue[0 .. n - first_part]) = task[first_part .. n];
                     }
                 }
                 atomicFence!(MemoryOrder.seq);
@@ -226,7 +226,7 @@ align(16) struct TaskQueue {
         return n;
     }
 
-    bool pull(Task* task) shared
+    bool pull(Task** task) shared
     {
         mixin(zoneMixin("Pull"));
         // printf("try pulling\n");
@@ -266,7 +266,7 @@ align(16) struct TaskQueue {
             }
             // printf("pulled task from queue\n");
 
-            *task = cast()(queue)[readP];
+            *task = cast(Task*)(queue)[readP];
             atomicFence!(MemoryOrder.seq)();
 
             atomicOp!"+="(readPointer, 1);

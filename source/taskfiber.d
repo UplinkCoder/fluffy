@@ -14,7 +14,7 @@ alias task_function_t = void function (Task*);
 class TaskFiber : Fiber
 {
     /*tls*/ static bool initLoop;
-    Task currentTask;
+    Task* currentTask;
     int idx;
     bool hasTask;
 
@@ -32,7 +32,11 @@ class TaskFiber : Fiber
         if (hasTask)
         {
             assert(state() != State.TERM, "Attempting to start a finished task");
-            currentTask.fn(&currentTask);
+            currentTask.fn(currentTask);
+            if (state() == State.TERM)
+            {
+                currentTask.hasCompleted_ = true;
+            }
             {
                 // string s = stateToString(state());
                 // printf("Task state after calling fn: %s\n", s.ptr);
@@ -46,7 +50,7 @@ class TaskFiber : Fiber
     void assignTask(Task* task)
     {
         assert(!hasTask);
-        this.currentTask = *task;
+        this.currentTask = task;
         hasTask = true;
     }
 
@@ -187,7 +191,7 @@ struct Task
     uint queueID;
 
     shared (TaskFiber)* currentFiber;
-    shared bool hasCompleted_ = false;
+    /*shared*/ bool hasCompleted_ = false;
     shared bool hasFiber = false;
     shared bool fiberIsExecuting = false;
 

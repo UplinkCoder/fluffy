@@ -1,3 +1,5 @@
+module fluffy.app;
+
 import core.memory : GC;
 import fluffy.taskfiber;
 import fluffy.ticket;
@@ -30,6 +32,7 @@ static  immutable task_function_t terminationDg =
 
 
 
+
     uint enqueueTermination(shared (TaskQueue)* q, string terminationMessage)
     {
         // little guard to we don't push the message if the chance of success is low
@@ -37,7 +40,8 @@ static  immutable task_function_t terminationDg =
             return false;
 
         auto terminationTask = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
-        return q.push(&terminationTask);
+        auto terminationTaskP = &terminationTask;
+        return q.push(&terminationTaskP);
     }
 void micro_sleep(uint micros)
 {
@@ -131,7 +135,7 @@ uint addTask(Task* task, uint myQueue = uint.max)
             currentQueue = 0;
         }
 
-        return g_queues[pushIntoQueue].push(task);
+        return g_queues[pushIntoQueue].push(&task);
     }
 }
 
@@ -245,7 +249,7 @@ private shared uint workersReady = 0;
     wait_until_workers_are_ready();
 
     /*tls*/ int myCounter = 0;
-    /*tls*/ Task task;
+    /*tls*/ Task *task;
 
     /*tls*/ static uint nextExecIdx;
     while(!killTheWorkers)
@@ -269,7 +273,7 @@ private shared uint workersReady = 0;
                     break;
                 }
                 execFiber = fiberPool.getNextFree();
-                execFiber.assignTask(&task);
+                execFiber.assignTask(task);
             }
             else if (!fiberPool.n_used)
             {
