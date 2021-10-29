@@ -318,17 +318,14 @@ align(16) struct TaskQueue {
             const readP = atomicLoad(readPointer) & (queue.length - 1);
             const writeP = atomicLoad(writePointer) & (queue.length - 1);
             // update readP and writeP
-            auto tasksFit = queue.length - tasksInQueue(readP, writeP);
 
-            if (n > tasksFit)
+            if (readP == writeP + 1 || // queue is full
+                tasksInQueue(readP, writeP) + n >= queue.length)
             {
+                // tests don't fit.
                 return 0;
             }
 
-            if (readP == writeP + 1)
-            {
-                return 0;
-            }
             // we know the tasks fit so there's no problem with us just updating
             // the write pointer here we have the old value if writeP
             atomicOp!"+="(writePointer, n);
