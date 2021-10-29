@@ -633,13 +633,10 @@ shared uint workersReady = 0;
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
                 int longest_queue_idx = -1;
-        enum work_stealing = true;
-        static if (work_stealing)
-        {
-                printf("Queue empty ... let's steal some work\n");
-
+                enum work_stealing = true;
+                static if (work_stealing)
                 {
-                    uint max_queue_length = 30; // a vicitm needs to have at least 30 tasks to be considered a target
+                    uint max_queue_length = 50; // a vicitm needs to have at least 100 tasks to be considered a target
                     shared(TaskQueue)* victim;
                     foreach(qIdx; 0 .. queues.length)
                     {
@@ -659,20 +656,16 @@ shared uint workersReady = 0;
                         while(!victim.queueLock.servingMe(ticket)) {}
                         
                         {
-                            printf("got the lock doing the steal\n");
                             mixin(zoneMixin("Stealing work"));
                             atomicFence!(MemoryOrder.seq)();
                             
                             auto n_stolen = victim.steal(steal_amount, myQueue, ticket);
-                            printf("stolen %d tasks\n", n_stolen);
                             atomicFence!(MemoryOrder.seq)();
                             victim.queueLock.releaseTicket(ticket);
-
                         }
                         continue;
                     }
-                }
-        } // work_stealing
+                } // work_stealing
                 if (longest_queue_idx == -1)
                 {
                     mixin(zoneMixin("Out of work ... no victim ... sleeping"));
