@@ -33,16 +33,17 @@ static  immutable task_function_t terminationDg =
 
 
 
-    uint enqueueTermination(shared (TaskQueue)* q, string terminationMessage)
-    {
-        // little guard to we don't push the message if the chance of success is low
-        if (q.tasksInQueue() > (q.queue.length - 4))
-            return false;
+uint enqueueTermination(shared (TaskQueue)* q, string terminationMessage)
+{
+    // little guard to we don't push the message if the chance of success is low
+    if (q.tasksInQueue() > (q.queue.length - 4))
+        return false;
 
-        auto terminationTask = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
-        auto terminationTaskP = &terminationTask;
-        return q.push(&terminationTaskP);
-    }
+    auto terminationTaskP = cast(Task*)alloc.alloc(Task.sizeof);
+    (*terminationTaskP) = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
+
+    return q.push(&terminationTaskP);
+}
 void micro_sleep(uint micros)
 {
     timespec ts;
@@ -281,7 +282,7 @@ private shared uint workersReady = 0;
                 mixin(zoneMixin("sleepnig"));
                 TaskQueue* q = cast(TaskQueue*)myQueue;
                 int longest_queue_idx = -1;
-                enum work_stealing = true;
+                enum work_stealing = false;
                 static if (work_stealing)
                 {
                     uint max_queue_length = 50; // a vicitm needs to have at least 100 tasks to be considered a target
