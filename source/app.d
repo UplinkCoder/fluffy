@@ -480,7 +480,9 @@ else
 
         if (!n_workers_)
             n_workers_ = totalCPUs - 1;
+
         auto workersAndQueues = fluffy_get_queues(n_workers_);
+        (cast()workersAndQueues.watcher).start(); // first start the watcher!
 
         shared ulong sum;
         shared TicketCounter sumSync;
