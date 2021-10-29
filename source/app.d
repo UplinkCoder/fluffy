@@ -369,27 +369,6 @@ shared uint n_workers = 0;
 shared TaskQueue*[] g_queues;
 shared Worker[] g_workers;
 
-version (MARS) {}
-else
-{
-    void main(string[] args)
-    {
-        
-        int n_workers_;
-        if (args.length == 2 && args[1].length && args[1].length < 3)
-        {
-            if (args[1].length == 2)
-                n_workers_ += ((args[1][0] - '0') * 10);
-            n_workers_ += (args[1][$-1] - '0');
-        }
-        import std.parallelism : totalCPUs;
-
-        if (!n_workers_)
-            n_workers_ = totalCPUs - 1;
-        auto myg_queues = fluffy_get_queues(n_workers_);        
-    }
-}
-
 void wait_until_workers_are_ready()
 {
     assert(atomicLoad(n_workers) != 0);
@@ -480,4 +459,125 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
     };
 
     return result;
+}
+
+
+version (MARS) {}
+else
+{
+    void main(string[] args)
+    {
+        import core.stdc.stdio;
+    
+        int n_workers_;
+        if (args.length == 2 && args[1].length && args[1].length < 3)
+        {
+            if (args[1].length == 2)
+                n_workers_ += ((args[1][0] - '0') * 10);
+            n_workers_ += (args[1][$-1] - '0');
+        }
+        import std.parallelism : totalCPUs;
+
+        if (!n_workers_)
+            n_workers_ = totalCPUs - 1;
+        auto workersAndQueues = fluffy_get_queues(n_workers_);
+
+        shared ulong sum;
+        shared TicketCounter sumSync;
+        auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
+        enum task_multiplier = 96;
+
+        WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : task_multiplier };
+
+        // now we can push the work!
+        auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
+        printf("sum before addnig tasks: %llu\n", sum);
+        enum main_task_issues = 32;
+        atomicStore(expected_completions, (task_multiplier * main_task_issues) + main_task_issues);
+
+        foreach(_;0 .. main_task_issues)
+        {
+            // we need to loop on addTask because we might haven't got the chacne to schdule it
+            while(!addTask(&workMaker))
+            {
+                mixin(zoneMixin("waiting for queue to empty"));
+                micro_sleep(1);
+            }
+        }
+        micro_sleep(70);
+        const expected = cast(ulong) (10_000 * main_task_issues * task_multiplier);
+        printf("expected: %llu\n", expected);
+
+        ulong lastSum;
+
+        while((lastSum = atomicLoad(sum)) != expected)
+        {
+            micro_sleep(310);
+            //printf("lastSum: %llu\n", lastSum);
+        }
+
+        foreach(ref w;workersAndQueues.workers)
+        {
+            (cast()w.workerThread).join();
+        }
+
+        printf("sum: %llu\n", sum);        
+    }
+}
+
+struct WorkMarkerArgs
+{
+    Task* work;
+    uint how_many;
+}
+
+@Task void workMakerFn(Task* task)
+{
+    TracyMessage("workMakerFn");
+
+    auto args = cast(WorkMarkerArgs*) task.taskData;
+
+    foreach(_; 0 .. args.how_many)
+    {
+        while(!addTask(args.work))
+        {
+            TracyMessage("work_maker_yield");
+            task.currentFiber.yield();
+            TracyMessage("work_maker_continue");
+        }
+    }
+    // printf("WorkMaker done\n");
+}
+
+@Task void countTaskFn(Task* task)
+{
+    with (task)
+    {
+        int x = 0;
+        while(++x != 10_000) {}
+
+
+        if (!syncLock)
+        {
+            assert(0, "The countTask needs a syncLock! since it has shared result");
+        }
+        const syncResultTicket = syncLock.drawTicket();
+
+        {
+            mixin(zoneMixin("waiting on result sync"));
+            while(!syncLock.servingMe(syncResultTicket)) {}
+            atomicFence();
+        }
+
+        {
+            // not shared because we aquired the lock
+            auto sumP = cast(ulong*) task.taskData;
+            (*sumP) += x;
+        }
+
+        {
+            atomicFence();
+            syncLock.releaseTicket(syncResultTicket);
+        }
+    }
 }
