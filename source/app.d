@@ -29,6 +29,16 @@ static  immutable task_function_t terminationDg =
     (Task*) { };
 
 
+
+    uint enqueueTermination(shared (TaskQueue)* q, string terminationMessage)
+    {
+        // little guard to we don't push the message if the chance of success is low
+        if (q.tasksInQueue() > (q.queue.length - 4))
+            return false;
+
+        auto terminationTask = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
+        return q.push(&terminationTask);
+    }
 void micro_sleep(uint micros)
 {
     timespec ts;
@@ -86,6 +96,45 @@ string* pushString(string s)
     return result;
 }
 
+uint addTask(Task* task, uint myQueue = uint.max)
+{
+    mixin(zoneMixin("addTask"));
+
+    /*tls*/ static currentQueue = 0;
+    uint pushIntoQueue = currentQueue;
+
+    static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (5f/6f));
+    if (myQueue != uint.max && g_queues[myQueue].tasksInQueue() < queueCutOff)
+    {
+        pushIntoQueue = myQueue;
+    }
+
+    version (multi_try)
+    {
+        auto maxAttempts = g_queues.length;
+
+        bool succeses = false;
+        while(maxAttempts-- && !succeses)
+        {
+            succeses = g_queues[currentQueue].push(task);
+            if (++currentQueue >= g_queues.length)
+                currentQueue = 0;
+        }
+
+        return succeses;
+    }
+    else
+    {
+
+        if (++currentQueue >= g_queues.length)
+        {
+            currentQueue = 0;
+        }
+
+        return g_queues[pushIntoQueue].push(task);
+    }
+}
+
 extern (C) void breakpoint () {}
 
 
@@ -112,10 +161,10 @@ shared uint expected_completions = uint.max;
     ulong lastCompletedTasks;
     uint no_progress;
 
-    char[32]* queueStringMem = cast(char[32]*)alloc.alloc(32 * cast(uint)workers.length);
-    char[32][] worker_queue_strings = queueStringMem[0 .. workers.length];
+    char[32]* queueStringMem = cast(char[32]*)alloc.alloc(32 * cast(uint)g_workers.length);
+    char[32][] worker_queue_strings = queueStringMem[0 .. g_workers.length];
 
-    worker_queue_strings.length = workers.length;
+    worker_queue_strings.length = g_workers.length;
     foreach(i, ref workerer_queue_string;worker_queue_strings)
     {
         sprintf(workerer_queue_string.ptr, "queue %d\0", cast(int) i);
@@ -126,10 +175,10 @@ shared uint expected_completions = uint.max;
     {
         lastCompletedTasks = atomicLoad!(MemoryOrder.raw)(completedTasks);
         ___tracy_emit_plot("completedTasks", lastCompletedTasks);
-        foreach(i; 0 .. workers.length)
+        foreach(i; 0 .. g_workers.length)
         {
-            TaskQueue* q = cast(TaskQueue*)queues[i];
-            ___tracy_emit_plot(worker_queue_strings[i].ptr, queues[i].tasksInQueue());
+            TaskQueue* q = cast(TaskQueue*)g_queues[i];
+            ___tracy_emit_plot(worker_queue_strings[i].ptr, g_queues[i].tasksInQueue());
         }
 
         micro_sleep(1);
@@ -144,13 +193,13 @@ shared uint expected_completions = uint.max;
             lastCompletedTasks, atomicLoad!(MemoryOrder.raw)(expected_completions));
         printf("watcher: enquing termination\n");
         mixin(zoneMixin("watcher: enqueueingTermnination"));
-        foreach(i; 0 .. workers.length)
+        foreach(i; 0 .. g_workers.length)
         {
             printf("termination for worker %d ... ", cast(int)i);
             bool enqueuedTermination = false;
             while(!enqueuedTermination)
             {
-                enqueuedTermination = !!queues[i].enqueueTermination("Watcher termination");
+                enqueuedTermination = !!g_queues[i].enqueueTermination("Watcher termination");
             }
             printf("Termination scheduled\n");
         }
@@ -172,11 +221,11 @@ private shared uint workersReady = 0;
 
     ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
-    /*tls*/ shared (bool) *terminate = &workers[workerIndex].terminate;
-    /*tls*/ shared(TaskQueue*)* myQueueP = &queues[workerIndex];
+    /*tls*/ shared (bool) *terminate = &g_workers[workerIndex].terminate;
+    /*tls*/ shared(TaskQueue*)* myQueueP = &g_queues[workerIndex];
     TaskQueue.initQueue(myQueueP, cast(short)(workerIndex + 1));
     shared (TaskQueue)* myQueue = *myQueueP;
-    /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&workers[workerIndex].workerFiberPool;
+    /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&g_workers[workerIndex].workerFiberPool;
     /*tls*/ int[fiberPool.fibers.length] fiberExecCount;
     {
         auto initTicket = globalLock.drawTicket();
@@ -233,9 +282,9 @@ private shared uint workersReady = 0;
                 {
                     uint max_queue_length = 50; // a vicitm needs to have at least 100 tasks to be considered a target
                     shared(TaskQueue)* victim;
-                    foreach(qIdx; 0 .. queues.length)
+                    foreach(qIdx; 0 .. g_queues.length)
                     {
-                        auto canidate = queues[qIdx];
+                        auto canidate = g_queues[qIdx];
                         auto canidate_n_tasks = canidate.tasksInQueue();
                         if (canidate_n_tasks > max_queue_length)
                         {
@@ -317,8 +366,8 @@ private shared uint workersReady = 0;
 }
 shared ulong completedTasks;
 shared uint n_workers = 0;
-shared TaskQueue*[] queues;
-shared Worker[] workers;
+shared TaskQueue*[] g_queues;
+shared Worker[] g_workers;
 
 version (MARS) {}
 else
@@ -337,7 +386,7 @@ else
 
         if (!n_workers_)
             n_workers_ = totalCPUs - 1;
-        auto myqueues = fluffy_get_queues(n_workers_);        
+        auto myg_queues = fluffy_get_queues(n_workers_);        
     }
 }
 
@@ -384,22 +433,22 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
     alloc = cast(shared) Alloc(ushort.max);
 
     printf("starting %d workers\n", n_workers);
-    workers.length = n_workers;
+    g_workers.length = n_workers;
 
     import core.stdc.stdio;
     import std.parallelism : totalCPUs;
     printf("Found %d cores\n", totalCPUs);
 
-    void* queuesMem = malloc(align16(((TaskQueue*).sizeof * workers.length)));
-    queues = (cast(shared(TaskQueue*)*)align16(cast(size_t)queuesMem))[0 .. workers.length];
+    void* queuesMem = malloc(align16(((TaskQueue*).sizeof * g_workers.length)));
+    g_queues = (cast(shared(TaskQueue*)*)align16(cast(size_t)queuesMem))[0 .. g_workers.length];
 
     atomicFence();
 
     {
         mixin(zoneMixin("Thread creation"));
-        foreach(i; 0 .. workers.length)
+        foreach(i; 0 .. g_workers.length)
         {
-            workers[i] = cast(shared) Worker(new Thread(&workerFunction));
+            g_workers[i] = cast(shared) Worker(new Thread(&workerFunction));
         }
     }
 
@@ -407,9 +456,9 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
 
     {
         mixin(zoneMixin("threadStartup"));
-        foreach(i; 0 .. workers.length)
+        foreach(i; 0 .. g_workers.length)
         {
-            (cast()workers[i].workerThread).start();
+            (cast()g_workers[i].workerThread).start();
         }
     }
 
@@ -423,11 +472,11 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
 
     WorkersQueuesAndWatcher result =
     {
-        workers : workers,
-        queues : queues,
-        watcher : watcher,
-        killTheWatcher = &killTheWatcher,
-        killTheWorkers : &killTheWorkers
+        queues : g_queues,
+        watcher : cast(shared)watcher,
+        killTheWatcher : &killTheWatcher,
+        killTheWorkers : &killTheWorkers,
+        workers : g_workers,
     };
 
     return result;

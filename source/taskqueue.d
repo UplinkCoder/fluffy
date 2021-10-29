@@ -1,42 +1,17 @@
 module fluffy.taskqueue;
 import fluffy.taskfiber;
+import fluffy.ticket;
+import core.atomic;
 
-uint addTask(Task* task, uint myQueue = uint.max)
+version (tracy)
 {
-    mixin(zoneMixin("addTask"));
-
-    /*tls*/ static currentQueue = 0;
-    uint pushIntoQueue = currentQueue;
-
-    static immutable queueCutOff = cast(int) (TaskQueue.init.queue.length * (5f/6f));
-    if (myQueue != uint.max && queues[myQueue].tasksInQueue() < queueCutOff)
+    import tracy;
+}
+else
+{
+    string zoneMixin(string zone)
     {
-        pushIntoQueue = myQueue;
-    }
-
-    version (multi_try)
-    {
-        auto maxAttempts = queues.length;
-
-        bool succeses = false;
-        while(maxAttempts-- && !succeses)
-        {
-            succeses = queues[currentQueue].push(task);
-            if (++currentQueue >= queues.length)
-                currentQueue = 0;
-        }
-
-        return succeses;
-    }
-    else
-    {
-
-        if (++currentQueue >= queues.length)
-        {
-            currentQueue = 0;
-        }
-
-        return queues[pushIntoQueue].push(task);
+        return "";
     }
 }
 
@@ -60,8 +35,6 @@ align(16) struct TaskQueue {
         // let's make sure though
         if (queueLock.currentlyServing != ticket.ticket)
         {
-            printf("queueLock not held by theif? -- thiefTicket: %d -- currentlyServing: %d",
-                ticket.ticket, queueLock.currentlyServing);
             assert(0);
         }
 
@@ -75,7 +48,6 @@ align(16) struct TaskQueue {
             const victimReadP = atomicLoad!(MemoryOrder.raw)(readPointer) & (queue.length - 1);
             const victimWriteP = atomicLoad!(MemoryOrder.raw)(writePointer) & (queue.length - 1);
             stolen_items = min(stealAmount, tasksInQueue(victimReadP, victimWriteP));
-            breakpoint;
             if (victimReadP <= victimWriteP // writeP - readP = items ok
                 || victimWriteP >= stolen_items // ignore wraparound if we don't steal across the boundry
             )
@@ -165,16 +137,6 @@ align(16) struct TaskQueue {
         (**q).readPointer = (**q).writePointer = 0;
         (**q).queueLock = TicketCounter.init;
         (**q).queueID = queueID;
-    }
-
-    uint enqueueTermination(string terminationMessage) shared
-    {
-        // little guard to we don't push the message if the chance of success is low
-        if (tasksInQueue() > (queue.length - 4))
-            return false;
-
-        auto terminationTask = Task(terminationDg, cast(shared void*) pushString(terminationMessage));
-        return push(&terminationTask);
     }
 
     uint push(Task* task, int n = 1) shared
