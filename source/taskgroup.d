@@ -16,7 +16,13 @@ struct TaskGroup
         workers = myWorkers;
         name = myName;
         parent = myParent;
-        taskGroupAllocator = cast(shared)Alloc(short.max);
+        taskGroupAllocator = cast(shared)Alloc(ushort.max * 32);
+    }
+
+    ~this()
+    {
+        awaitCompletionOfAllTasks();
+        //TODO free allocations!
     }
 
     Task*[] tasks;
@@ -36,7 +42,6 @@ struct TaskGroup
             F(argsP.args);
             atomicFence!(MemoryOrder.seq);
             atomicStore(taskP.hasCompleted_, true);
-            printf("We did taskP inside: %p\n", taskP);
         }, cast (shared void*)holder);
         task.taskgroup = &this;
         tasks ~= task;
@@ -48,12 +53,14 @@ struct TaskGroup
     {
         foreach(t;tasks)
         {
-            printf("task: %p\n", t);
-            .addTask(t);
-            atomicFence();
-            while(!atomicLoad!(MemoryOrder.raw)(t.hasCompleted_)) {  }
+            // do not attempt to run a completed task again.
+            if (!atomicLoad!(MemoryOrder.raw)(t.hasCompleted_))
+                .addTask(t);
+        }
 
-            atomicFence();
+        foreach(t;tasks)
+        {
+            while(!atomicLoad!(MemoryOrder.raw)(t.hasCompleted_)) {  }
         }
 
     }

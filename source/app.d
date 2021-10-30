@@ -54,6 +54,7 @@ void micro_sleep(uint micros)
 
 struct Alloc
 {
+    uint initialSize;
     ubyte* memPtr;
     uint capacity_remaining;
     shared TicketCounter allocLock;
@@ -63,11 +64,12 @@ struct Alloc
         import core.stdc.stdlib;
         size = cast(uint) align16(size);
         memPtr = cast(ubyte*) malloc(size);
+        initialSize = size;
 
         capacity_remaining = size;
     }
 
-    ubyte* alloc(uint sz) shared
+    ubyte* alloc(uint sz, int line = __LINE__, string file = __FILE__) shared
     {
         auto ticket = allocLock.drawTicket();
         while (!allocLock.servingMe(ticket)) {}
@@ -76,7 +78,7 @@ struct Alloc
         scope(exit) allocLock.releaseTicket(ticket);
 
         sz = cast(uint)align16(sz);
-        assert(capacity_remaining > sz);
+        assert(capacity_remaining > sz, "not enough memory allocated for alloc in " ~ file);
         ubyte* result = cast(ubyte*)(memPtr);
         (cast()memPtr) += sz;
         (cast()capacity_remaining) -= sz;
@@ -194,19 +196,19 @@ shared uint expected_completions = uint.max;
     micro_sleep(5);
 
     {
-        printf("lastCompletedTasks -- %llu -- expected_completions %u",
-            lastCompletedTasks, atomicLoad!(MemoryOrder.raw)(expected_completions));
-        printf("watcher: enquing termination\n");
+        printf("lastCompletedTasks -- %llu\n",
+            lastCompletedTasks);
+        // printf("watcher: enquing termination\n");
         mixin(zoneMixin("watcher: enqueueingTermnination"));
         foreach(i; 0 .. g_workers.length)
         {
-            printf("termination for worker %d ... ", cast(int)i);
+            // printf("termination for worker %d ... ", cast(int)i);
             bool enqueuedTermination = false;
             while(!enqueuedTermination)
             {
                 enqueuedTermination = !!g_queues[i].enqueueTermination("Watcher termination");
             }
-            printf("Termination scheduled\n");
+            // printf("Termination scheduled\n");
         }
     }
     TracyMessage("Watcher says bye!");
@@ -269,7 +271,7 @@ private shared uint workersReady = 0;
                     foreach(fIdx; 0 .. fiberPool.fibers.length)
                     {
                         const eCount = fiberExecCount[fIdx];
-                        if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
+                        // if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
                     }
                     break;
                 }
@@ -414,7 +416,7 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
     (cast(uint)n_workers) = n_workers_;
 
     import core.stdc.stdlib;
-    alloc = cast(shared) Alloc(ushort.max);
+    alloc = cast(shared) Alloc(ushort.max * 8);
 
     printf("starting %d workers\n", n_workers);
     g_workers.length = n_workers;
@@ -449,7 +451,7 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
     // we need to wait until all the threads had a chance to init their queues
     wait_until_workers_are_ready();
 
-    printf ("workers are ready it seems\n");
+    // printf ("workers are ready it seems\n");
     // fire up the watcher which terminates the threads
     // before we push tasks since it also reports stats
     auto watcher = new Thread(&watcherFunction, 128);

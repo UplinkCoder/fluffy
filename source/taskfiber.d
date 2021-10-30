@@ -192,17 +192,10 @@ struct Task
 
     shared (TaskFiber)* currentFiber;
     /*shared*/ bool hasCompleted_ = false;
-    shared bool hasFiber = false;
-    shared bool fiberIsExecuting = false;
 
     Ticket creation_ticket;
     uint completion_attempts;
 
-    bool hasCompleted(string file = __FILE__, int line = __LINE__) shared
-    {
-        // printf("[%s:+%d]asking has Completed \n", file.ptr, line);
-        return (atomicLoad(hasCompleted_) || (atomicLoad(hasFiber) && !fiberIsExecuting && (cast(TaskFiber*)currentFiber).hasCompleted()));
-    }
     //debug (task)
     //{
         OriginInformation originInfo;

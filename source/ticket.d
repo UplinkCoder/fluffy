@@ -34,7 +34,7 @@ struct TicketCounter
         return currentlyServing - nextTicket;
     }
 
-    Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
+    Ticket drawTicket(string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared pure
     {
         pragma(inline, true);
         version (no_sync)
@@ -57,7 +57,7 @@ struct TicketCounter
         }
     }
 
-    void releaseTicket(Ticket ticket) shared
+    void releaseTicket(Ticket ticket) shared pure
     {
         pragma(inline, true);
         version (no_sync) 
@@ -77,7 +77,7 @@ struct TicketCounter
         }
     }
 
-    bool servingMe(Ticket ticket, string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared
+    bool servingMe(Ticket ticket, string func = __FUNCTION__, string file = __FILE__, int line = __LINE__) shared pure
     {
         pragma(inline, true);
         version (no_sync)
