@@ -202,15 +202,11 @@ align(16) struct TaskQueue {
                 }
                 atomicFence!(MemoryOrder.seq);
                 {
-                    version = speical_one;
-                    version (speical_one)
-                    {
                     if (n == 1)
                     {
                         (*cast(Task**)&queue[writeP + n <= queue.length ? writeP : 0]) = *task;
                         return 1;
                     }
-                    } 
                     // let's do the simple case first
                     if (writeP + n <= queue.length)
                     {
