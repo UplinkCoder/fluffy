@@ -202,6 +202,7 @@ align(16) struct TaskQueue {
                 }
                 atomicFence!(MemoryOrder.seq);
                 {
+                    version = speical_one;
                     version (speical_one)
                     {
                     if (n == 1)
