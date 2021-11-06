@@ -1,20 +1,28 @@
-extern (C):
+module fluffy.tracy;
 
+extern (C):
+pure @trusted nothrow :
 version (tracy)
 {
-void TracyMessage(string msg, int callstack = 0)
-{
-    import core.stdc.stdlib : alloca;
-    auto mem = cast(char*)alloca(msg.length + 1);
-    mem[0 .. msg.length] = msg[0 .. msg.length];
-    mem[msg.length] = '\0';
-    ___tracy_emit_message(mem, msg.length, callstack);
-}
-}
-else
-{
-    void TracyMessage(string msg, int callstack = 0)  {}
-}
+    void FiberEnter(const char* name)
+    {
+        ___tracy_emit_fiber_enter(name);
+    }
+
+    void FiberLeave()
+    {
+        ___tracy_emit_fiber_leave();
+    }
+
+    void TracyMessage(string msg, int callstack = 0)
+    {
+        import core.stdc.stdlib : alloca;
+        auto mem = cast(char*)alloca(msg.length + 1);
+        mem[0 .. msg.length] = msg[0 .. msg.length];
+        mem[msg.length] = '\0';
+        ___tracy_emit_message(mem, msg.length, callstack);
+    }
+
 string zoneMixin(string name, uint callstack_depth = 64, string file = __FILE__, string function_ = __FUNCTION__, uint line = __LINE__)
 {
     static string itos_(const uint val) pure @trusted nothrow
@@ -87,6 +95,8 @@ alias TracyCZoneCtx = ___tracy_c_zone_context;
 
 TracyCZoneCtx ___tracy_emit_zone_begin (const(___tracy_source_location_data)* srcloc, int active);
 TracyCZoneCtx ___tracy_emit_zone_begin_callstack (const(___tracy_source_location_data)* srcloc, int depth, int active);
+pure @nogc @trusted nothrow :
+
 void ___tracy_emit_zone_end (TracyCZoneCtx ctx);
 void ___tracy_emit_zone_text (TracyCZoneCtx ctx, const(char)* txt, size_t size);
 void ___tracy_emit_zone_name (TracyCZoneCtx ctx, const(char)* txt, size_t size);
@@ -108,3 +118,20 @@ void ___tracy_emit_frame_image (const(void)* image, ushort w, ushort h, ubyte of
 
 void ___tracy_emit_plot (const(char)* name, double val);
 void ___tracy_emit_message_appinfo (const(char)* txt, size_t size);
+
+void ___tracy_set_thread_name(const (char)* name);
+
+void ___tracy_emit_fiber_enter(const (char)* name);
+void ___tracy_emit_fiber_leave ();
+}
+else
+{
+    void TracyMessage(string msg, int callstack = 0)  {}
+    void FiberEnter(const char* name) {}
+    void FiberLeave() {}
+    void ___tracy_emit_plot(const char* name, double value) {}
+    string zoneMixin(string zoneName) { return ""; }
+    void ___tracy_emit_message (const(char)* txt, size_t size, int callstack) {}
+    void ___tracy_set_thread_name(const (char)* name) {}
+}
+

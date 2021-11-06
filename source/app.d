@@ -10,28 +10,10 @@ import core.stdc.stdio;
 import core.sys.posix.signal : timespec;
 import core.sys.posix.time;
 import core.time;
-version (tracy)
-{
-    import tracy;
-}
-else
-{
-    extern (C) void ___tracy_set_thread_name( const char* name ) {}
-    extern (C) void ___tracy_emit_plot ( const char* name, double value ) {}
-    extern (C) void ___tracy_emit_message ( const char* name, size_t length, int callstack ) {}
+import fluffy.tracy;
 
-    void TracyMessage(string message) {}
-
-    string zoneMixin(string zoneName)
-    {
-        return "";
-    }
-}
 static  immutable task_function_t terminationDg =
     (Task*) { };
-
-
-
 
 uint enqueueTermination(shared (TaskQueue)* q, string terminationMessage)
 {
@@ -174,7 +156,7 @@ shared uint expected_completions = uint.max;
     worker_queue_strings.length = g_workers.length;
     foreach(i, ref workerer_queue_string;worker_queue_strings)
     {
-        sprintf(workerer_queue_string.ptr, "queue %d\0", cast(int) i);
+        sprintf(workerer_queue_string.ptr, "queue + active tasks %d\0", cast(int) i);
     }
 
     TracyMessage("Watcher says Hello!");
@@ -185,7 +167,7 @@ shared uint expected_completions = uint.max;
         foreach(i; 0 .. g_workers.length)
         {
             TaskQueue* q = cast(TaskQueue*)g_queues[i];
-            ___tracy_emit_plot(worker_queue_strings[i].ptr, g_queues[i].tasksInQueue());
+            ___tracy_emit_plot(worker_queue_strings[i].ptr, g_queues[i].tasksInQueue() + (cast()g_workers[i].workerFiberPool).n_used());
         }
 
         micro_sleep(1);
@@ -221,19 +203,26 @@ private shared uint workersReady = 0;
     mixin(zoneMixin("workerFunction"));
 
     static shared int workerCounter;
-    /*tls*/ short workerIndex = cast(short)(atomicOp!"+="(workerCounter, 1) - 1);
-    /*tls*/ char[16] worker_name;
+    short workerIndex = cast(short)(atomicOp!"+="(workerCounter, 1) - 1);
+    char[16] worker_name;
     sprintf(&worker_name[0], "Worker %d", workerIndex);
     printf("%s is starting\n", &worker_name[0]);
 
     ___tracy_set_thread_name(&worker_name[0]);
     // printf("Startnig: %d\n", workerIndex);
-    /*tls*/ shared (bool) *terminate = &g_workers[workerIndex].terminate;
-    /*tls*/ shared(TaskQueue*)* myQueueP = &g_queues[workerIndex];
+    shared (bool) *terminate = &g_workers[workerIndex].terminate;
+    shared(TaskQueue*)* myQueueP = &g_queues[workerIndex];
     TaskQueue.initQueue(myQueueP, cast(short)(workerIndex + 1));
     shared (TaskQueue)* myQueue = *myQueueP;
-    /*tls*/ FiberPool* fiberPool = cast(FiberPool*)&g_workers[workerIndex].workerFiberPool;
-    /*tls*/ int[fiberPool.fibers.length] fiberExecCount;
+     FiberPool* fiberPool = cast(FiberPool*)&g_workers[workerIndex].workerFiberPool;
+    int[fiberPool.fibers.length] fiberExecCount;
+    char[32][fiberPool.fibers.length] fiberNames;
+    foreach(fIdx; 0 .. fiberPool.fibers.length)
+    {
+        sprintf(fiberNames[fIdx].ptr, "%s -- Fiber %d", worker_name.ptr, cast(int)fIdx);
+        import fluffy.tracy;
+    }
+
     {
         auto initTicket = globalLock.drawTicket();
 
@@ -255,7 +244,7 @@ private shared uint workersReady = 0;
     /*tls*/ Task *task;
 
     /*tls*/ static uint nextExecIdx;
-    while(!killTheWorkers)
+    while(true)
     {
         // mixin(zoneMixin("WorkerLoop"));
         TaskFiber execFiber;
@@ -263,7 +252,7 @@ private shared uint workersReady = 0;
         {
             if (myQueue.pull(&task))
             {
-                if (task.fn is terminationDg)
+                if (task.fn is terminationDg || killTheWorkers)
                 {
                     auto terminationMessage = cast(string*) task.taskData;
                     ___tracy_emit_message("recieved termination signal", "recieved termination signal".length, 0);
@@ -271,7 +260,7 @@ private shared uint workersReady = 0;
                     foreach(fIdx; 0 .. fiberPool.fibers.length)
                     {
                         const eCount = fiberExecCount[fIdx];
-                        // if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
+                        if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
                     }
                     break;
                 }
@@ -331,7 +320,7 @@ private shared uint workersReady = 0;
 
         if (!execFiber)
         {
-            mixin(zoneMixin("FindNextFiber"));
+            mixin(zoneMixin(`FindNextFiber`));
             // if we didn't add a task just now chose a random fiber to exec
             const nonFree = (~fiberPool.freeBitfield);
             ulong nextExecMask;
@@ -348,6 +337,7 @@ private shared uint workersReady = 0;
                 }
                 localNextIdx = (++localNextIdx & (fiberPool.fibers.length - 1));
             }
+            assert(execFiber.hasTask, "Chosing fiber which doesn't have a task");
         }
         //___tracy_emit_plot(worker_name.ptr, fiberPool.freeBitfield);
         // execute a fiber in the pool
@@ -357,10 +347,30 @@ private shared uint workersReady = 0;
             //printf("executing fiber: %p -- idx:%d\n", execFiber, execFiber.idx);
             //printf("stateBeforeExec: %s\n", execFiber.stateToString(execFiber.state()).ptr);
             assert(execFiber.state() == execFiber.state().HOLD, execFiber.stateToString(execFiber.state()));
+            version (MARS)
+            {
+                import dmd.globals;
+                // set task_local state to thread_local state
+                task_local = execFiber.currentTask.task_local_state;
+            }
             execFiber.call();
+            version (MARS)
+            {
+                import dmd.globals;
+                // set task_local state to thread_local state
+                execFiber.currentTask.task_local_state = task_local;
+            }
             // if this completed the fiber we need to to reset it and send it back to the pool
             if (execFiber.state() == execFiber.state().TERM)
             {
+                version(MARS)
+                {
+                    // when we have completed a task we need to put our gaggedErrors into the parent
+                    if (auto p = execFiber.currentTask.parent)
+                    {
+                        p.task_local_state.gaggedErrors += execFiber.currentTask.task_local_state.gaggedErrors;
+                    }
+                }
                 atomicOp!"+="(completedTasks, 1);
                 execFiber.hasTask = false;
                 fiberPool.free(execFiber);
@@ -416,7 +426,7 @@ WorkersQueuesAndWatcher fluffy_get_queues(uint n_workers_)
     (cast(uint)n_workers) = n_workers_;
 
     import core.stdc.stdlib;
-    alloc = cast(shared) Alloc(ushort.max * 8);
+    alloc = cast(shared) Alloc(ushort.max * 4);
 
     printf("starting %d workers\n", n_workers);
     g_workers.length = n_workers;

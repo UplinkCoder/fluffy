@@ -3,17 +3,7 @@ import fluffy.taskfiber;
 import fluffy.ticket;
 import core.atomic;
 
-version (tracy)
-{
-    import tracy;
-}
-else
-{
-    string zoneMixin(string zone)
-    {
-        return "";
-    }
-}
+import fluffy.tracy;
 
 align(16) struct TaskQueue {
     align (16) shared TicketCounter queueLock;

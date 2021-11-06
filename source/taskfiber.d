@@ -6,9 +6,9 @@ import core.stdc.stdio;
 
 import core.atomic;
 
-import core.thread.myFiber;
+import core.thread.fiber;
 import fluffy.ticket;
-
+import fluffy.tracy;
 alias task_function_t = void function (Task*);
 
 class TaskFiber : Fiber
@@ -27,18 +27,34 @@ class TaskFiber : Fiber
         this.idx = idx;
     }
 
+    void suspend()
+    {
+
+        currentTask.isSuspended = true;
+        yield();
+    }
+
     void doTask()
     {
         if (hasTask)
         {
             assert(state() != State.TERM, "Attempting to start a finished task");
+            version (MARS)
+            {
+                import dmd.globals;
+                // set task_local state to thread_local state
+                task_local = currentTask.task_local_state;
+
+            }
+            currentTask.isSuspended = false;
             currentTask.fn(currentTask);
             if (state() == State.TERM)
             {
                 currentTask.hasCompleted_ = true;
             }
+            else
             {
-                // string s = stateToString(state());
+                string s = stateToString(state());
                 // printf("Task state after calling fn: %s\n", s.ptr);
             }
         }
@@ -171,8 +187,30 @@ struct Task
 {
     task_function_t fn;
     shared (void*) taskData;
+
     // shared (void*) taskResult;
+    char* function (Task* _this) printFunction;
+
     shared (TicketCounter)* syncLock;
+
+    bool isSuspended;
+
+    version (MARS)
+    {
+        import dmd.globals;
+        typeof (task_local) task_local_state;
+    }
+
+
+    this(task_function_t myFn, char* function (Task* _this) printFunction, shared void *myTaskData = null, shared (TicketCounter*) myLock = null)
+    {
+        import core.atomic;
+        this.fn = myFn;
+        this.printFunction = printFunction;
+        this.taskData = myTaskData;
+        this.syncLock = myLock;
+        this.taskId = atomicOp!"+="(runningId, 1);
+    }
 
     this(task_function_t myFn, shared void *myTaskData = null, shared (TicketCounter*) myLock = null)
     {
@@ -185,8 +223,11 @@ struct Task
 
     align(16) shared TicketCounter taskLock;
 
-    shared Task*[] children;
+    shared (TicketCounter) childLock;
+
+    Task*[] children;
     shared size_t n_children_completed;
+    Task* parent;
 
     uint queueID;
 
