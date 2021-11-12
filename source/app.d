@@ -246,23 +246,29 @@ private shared uint workersReady = 0;
     /*tls*/ static uint nextExecIdx;
     while(true)
     {
+        if (killTheWorkers)
+        {
+        Lterminal:
+            foreach(fIdx; 0 .. fiberPool.fibers.length)
+            {
+                const eCount = fiberExecCount[fIdx];
+                if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
+            }
+            killTheWatcher = true;
+            break;
+        }
         // mixin(zoneMixin("WorkerLoop"));
         TaskFiber execFiber;
         if (auto idx = fiberPool.nextFree())
         {
             if (myQueue.pull(&task))
             {
-                if (task.fn is terminationDg || killTheWorkers)
+                if (task.fn is terminationDg)
                 {
                     auto terminationMessage = cast(string*) task.taskData;
                     ___tracy_emit_message("recieved termination signal", "recieved termination signal".length, 0);
                     TracyMessage(*terminationMessage);
-                    foreach(fIdx; 0 .. fiberPool.fibers.length)
-                    {
-                        const eCount = fiberExecCount[fIdx];
-                        if (eCount) printf("fiber %d -- exeCount: %d\n", cast(int) fIdx, eCount);
-                    }
-                    break;
+                    goto Lterminal;
                 }
                 execFiber = fiberPool.getNextFree();
                 execFiber.assignTask(task);
@@ -501,46 +507,105 @@ else
         auto workersAndQueues = fluffy_get_queues(n_workers_);
         (cast()workersAndQueues.watcher).start(); // first start the watcher!
 
-        shared ulong sum;
-        shared TicketCounter sumSync;
-        auto counterTask = Task(&countTaskFn, cast(shared void*)&sum, &sumSync);
-        enum task_multiplier = 96;
+        import fluffy.taskgroup;
 
-        WorkMarkerArgs workMarkerArgs = { work : &counterTask, how_many : task_multiplier };
+        auto taskGroupMemory = cast(shared)Alloc(ushort.max);
 
-        // now we can push the work!
-        auto workMaker = Task(&workMakerFn, cast(shared void*)&workMarkerArgs);
-        printf("sum before addnig tasks: %llu\n", sum);
-        enum main_task_issues = 32;
-        atomicStore(expected_completions, (task_multiplier * main_task_issues) + main_task_issues);
+        TaskGroup theTaskGroup = TaskGroup(&workersAndQueues, "mainTaskGroup", &taskGroupMemory);
 
-        foreach(_;0 .. main_task_issues)
-        {
-            // we need to loop on addTask because we might haven't got the chacne to schdule it
-            while(!addTask(&workMaker))
+
+        int a, b, c, d, e, f, g;
+        theTaskGroup.addTask!(
+            (int* a, int* b, int* c, int* d, int* e, int* f, int* g)
             {
-                mixin(zoneMixin("waiting for queue to empty"));
-                micro_sleep(1);
-            }
-        }
-        micro_sleep(70);
-        const expected = cast(ulong) (10_000 * main_task_issues * task_multiplier);
-        printf("expected: %llu\n", expected);
+                auto theAwaiter = allocateInParent("theAwaiter");
+                theAwaiter.addTask!(
+                    (int* a, int* b, int* c, int* d, int* e, int* f, int* g)
+                    {
+                        auto depTasks1 = allocateInParent("depTasks1");
+                        auto depTasks2 = allocateInParent("depTasks2");
+                        auto taskBarrier1 = allocateInParent("taskBarrier");
 
-        ulong lastSum;
+                        depTasks1.addTask!(
+                            (int *a, int *b, int *c)
+                            {
+                                (*a) = 19;
+                                (*b) = 7;
+                                (*c) = 93;
+                            })(a, b, c);
+                        // there's no order between depTasks1 and depTasks2 which is alright nice they are independent
+                        depTasks2.addTask!(
+                            (int *d, int *e, int *f, int* g)
+                            {
+                                auto depTasks_2_1 = allocateInParent("depTasks2_1");
+                                auto depTasks_2_2 = allocateInParent("depTasks2_2");
 
-        while((lastSum = atomicLoad(sum)) != expected)
-        {
-            micro_sleep(310);
-            //printf("lastSum: %llu\n", lastSum);
-        }
+                                depTasks_2_1.addTask!(
+                                    (int * d, int * e)
+                                    {
+                                        (*d) = 23;
+                                        (*e) = 32;
+                                    })(d, e);
+
+                                depTasks_2_2.addTask!(
+                                    (int * f)
+                                    {
+                                        (*f) = 53;
+                                    })(f);
+                                depTasks_2_2.addTask!(
+                                    (int * g)
+                                    {
+                                        (*g) = 42;
+                                    })(g);
+                                /// ------------------ our own little barrier -----------
+                                depTasks_2_1.awaitCompletionOfAllTasks();
+                                depTasks_2_2.awaitCompletionOfAllTasks();
+                            })(d, e, f, g);
+
+                        taskBarrier1.addTask!(
+                            (TaskGroup* depTasks1)
+                            {
+                                depTasks1.awaitCompletionOfAllTasks();
+                            })(depTasks1);
+                        taskBarrier1.addTask!(
+                            (TaskGroup* depTasks2)
+                            {
+                                depTasks2.awaitCompletionOfAllTasks();
+                            })(depTasks2);
+                        
+
+                        taskBarrier1.awaitCompletionOfAllTasks();
+                        // ---------------- order is enforced here -------------------------------
+                        auto depTasks3 = allocateInParent("depTasks3");
+                        depTasks3.addTask!(
+                            (int* a, int* b, int* c, int* d, int* e, int* f, int* g)
+                            {
+                                (*a) += *b;
+                                (*a) += *c;
+                                (*a) += *d;
+                                (*a) += *e;
+                                (*a) += *f;
+                                (*a) += *g;
+                            })(a, b, c, d, e, f, g);
+                        depTasks3.awaitCompletionOfAllTasks();
+                    })(a, b, c, d, e, f, g);
+                theAwaiter.awaitCompletionOfAllTasks();
+            }) (&a, &b, &c, &d, &e, &f, &g);
+        theTaskGroup.awaitCompletionOfAllTasks();
+
+        import fluffy.taskgroup;
+
+        printf("a = %d, b = %d, c = %d, d = %d, e = %d, f = %d\n", a, b, c, d, e, f, g);
+        printf("%s\n", taskGraph(theTaskGroup.tasks[0]).ptr);
+
+
+        (*workersAndQueues.killTheWorkers) = true;
 
         foreach(ref w;workersAndQueues.workers)
         {
             (cast()w.workerThread).join();
         }
 
-        printf("sum: %llu\n", sum);
     }
 }
 
